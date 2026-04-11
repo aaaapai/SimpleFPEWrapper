@@ -1,9 +1,4 @@
-//
-// Created by hanji on 2025/3/29.
-//
-
-#ifndef MOBILEGLUES_PLUGIN_POINTER_UTILS_H
-#define MOBILEGLUES_PLUGIN_POINTER_UTILS_H
+#pragma once
 
 #include <GL/gl.h>
 
@@ -14,5 +9,3 @@ public:
     static int type_to_bytes(GLenum type);
     static int pname_to_count(GLenum pname);
 };
-
-#endif // MOBILEGLUES_PLUGIN_POINTER_UTILS_H

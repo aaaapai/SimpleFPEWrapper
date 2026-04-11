@@ -1,9 +1,4 @@
-//
-// Created by Swung 0x48 on 2025/2/10.
-//
-
-#ifndef MOBILEGLUES_VERTEXPOINTER_H
-#define MOBILEGLUES_VERTEXPOINTER_H
+#pragma once
 
 #include "GL/gl.h"
 #include "types.h"
@@ -26,5 +21,3 @@ extern "C"
 #ifdef __cplusplus
 }
 #endif
-
-#endif // MOBILEGLUES_VERTEXPOINTER_H

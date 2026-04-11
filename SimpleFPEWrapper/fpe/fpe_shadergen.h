@@ -1,9 +1,4 @@
-//
-// Created by Swung 0x48 on 2025/3/18.
-//
-
-#ifndef MOBILEGLUES_FPE_SHADERGEN_H
-#define MOBILEGLUES_FPE_SHADERGEN_H
+#pragma once
 
 #include <string>
 #include "defines.h"
@@ -29,5 +24,3 @@ private:
     const fixed_function_state_t& state_;
     scratch_t scratch_;
 };
-
-#endif // MOBILEGLUES_FPE_SHADERGEN_H

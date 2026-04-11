@@ -1,7 +1,3 @@
-//
-// Created by Swung 0x48 on 2025/2/8.
-//
-
 #include "fpe.hpp"
 #include <glm/gtc/type_ptr.hpp>
 
@@ -78,19 +74,19 @@ bool fpe_inited = false;
 int init_fpe() {
     // LOG_I("Initializing fixed-function pipeline...")
 
-    g_glesFuncs.glGenVertexArrays(1, &g_glstate.fpe_state.fpe_vao);
+    g_glFuncs.glGenVertexArrays(1, &g_glstate.fpe_state.fpe_vao);
 
-    g_glesFuncs.glGenBuffers(1, &g_glstate.fpe_state.fpe_vbo);
+    g_glFuncs.glGenBuffers(1, &g_glstate.fpe_state.fpe_vbo);
 
-    g_glesFuncs.glGenBuffers(1, &g_glstate.fpe_state.fpe_ibo);
+    g_glFuncs.glGenBuffers(1, &g_glstate.fpe_state.fpe_ibo);
 
     // LOG_D("fpe_vao: %d", g_glstate.fpe_state.fpe_vao)
     // LOG_D("fpe_vbo: %d", g_glstate.fpe_state.fpe_vbo)
     // LOG_D("fpe_ibo: %d", g_glstate.fpe_state.fpe_ibo)
 
-    g_glesFuncs.glBindVertexArray(g_glstate.fpe_state.fpe_vao);
+    g_glFuncs.glBindVertexArray(g_glstate.fpe_state.fpe_vao);
 
-    g_glesFuncs.glBindVertexArray(0);
+    g_glFuncs.glBindVertexArray(0);
 
     return 0;
 }
@@ -112,23 +108,23 @@ int commit_fpe_state_on_draw(GLenum* mode, GLint* first, GLsizei* count) {
     vpa.generate_compressed_index(g_glstate.fpe_state.fpe_draw.current_data.sizes.data);
     // kinda cursed...
     raw_vpa.generate_compressed_index(g_glstate.fpe_state.fpe_draw.current_data.sizes.data);
-    //    g_glesFuncs.glGenVertexArrays(1, &vpa.fpe_vao);
+    //    g_glFuncs.glGenVertexArrays(1, &vpa.fpe_vao);
     // LOG_D("fpe_vao: %d", g_glstate.fpe_state.fpe_vao)
-    g_glesFuncs.glBindVertexArray(g_glstate.fpe_state.fpe_vao);
+    g_glFuncs.glBindVertexArray(g_glstate.fpe_state.fpe_vao);
 
     auto key = g_glstate.program_hash();
     // LOG_D("%s: key=0x%x", __func__, key)
     auto& prog = g_glstate.get_or_generate_program(key);
     int prog_id = prog.get_program();
     // if (prog_id < 0) LOG_D("Error: FPE shader link failed!")
-    g_glesFuncs.glUseProgram(prog_id);
+    g_glFuncs.glUseProgram(prog_id);
 
     GLint prev_vbo = 0;
-    g_glesFuncs.glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &prev_vbo);
+    g_glFuncs.glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &prev_vbo);
 
     // Ugh...Why binding vbo is required BEFORE calling VertexAttrib* functions?
     if (prev_vbo == 0) {
-        g_glesFuncs.glBindBuffer(GL_ARRAY_BUFFER, g_glstate.fpe_state.fpe_vbo);
+        g_glFuncs.glBindBuffer(GL_ARRAY_BUFFER, g_glstate.fpe_state.fpe_vbo);
     }
 
     // LOG_D("starting_ptr = %p", vpa.starting_pointer)
@@ -166,7 +162,7 @@ int commit_fpe_state_on_draw(GLenum* mode, GLint* first, GLsizei* count) {
         // vpa.starting_pointer,
         //      g_glstate.fpe_state.fpe_vbo)
 
-        g_glesFuncs.glBufferData(GL_ARRAY_BUFFER, *count * vpa.stride, vpa.starting_pointer, GL_DYNAMIC_DRAW);
+        g_glFuncs.glBufferData(GL_ARRAY_BUFFER, *count * vpa.stride, vpa.starting_pointer, GL_DYNAMIC_DRAW);
 
     } else {
         // LOG_D("Using already bound VB")
@@ -179,10 +175,10 @@ int commit_fpe_state_on_draw(GLenum* mode, GLint* first, GLsizei* count) {
         //      g_glstate.fpe_state.fpe_ib.size() * sizeof(uint32_t), g_glstate.fpe_state.fpe_ib.data(),
         //      g_glstate.fpe_state.fpe_ibo)
 
-        g_glesFuncs.glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_glstate.fpe_state.fpe_ibo);
+        g_glFuncs.glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_glstate.fpe_state.fpe_ibo);
 
-        g_glesFuncs.glBufferData(GL_ELEMENT_ARRAY_BUFFER, g_glstate.fpe_state.fpe_ib.size() * sizeof(uint32_t),
-                                 g_glstate.fpe_state.fpe_ib.data(), GL_DYNAMIC_DRAW);
+        g_glFuncs.glBufferData(GL_ELEMENT_ARRAY_BUFFER, g_glstate.fpe_state.fpe_ib.size() * sizeof(uint32_t),
+                               g_glstate.fpe_state.fpe_ib.data(), GL_DYNAMIC_DRAW);
 
         *count = g_glstate.fpe_state.fpe_ib.size();
 

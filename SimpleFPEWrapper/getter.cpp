@@ -13,33 +13,32 @@ const GLubyte* glGetString(GLenum name) {
     case GL_VERSION:
         static std::string cachedVersionString;
         if (cachedVersionString.empty()) {
-            cachedVersionString =
-                std::string((char*)g_glesFuncs.glGetString(GL_VERSION)) + " (with Simple FPE Wrapper)";
+            cachedVersionString = std::string((char*)g_glFuncs.glGetString(GL_VERSION)) + " (with Simple FPE Wrapper)";
         }
         return (const GLubyte*)cachedVersionString.c_str();
     case GL_RENDERER:
         static std::string cachedRendererString;
         if (cachedRendererString.empty()) {
-            cachedRendererString = std::string((char*)g_glesFuncs.glGetString(GL_RENDERER)) + " (SFPEW)";
+            cachedRendererString = std::string((char*)g_glFuncs.glGetString(GL_RENDERER)) + " (SFPEW)";
         }
         return (const GLubyte*)cachedRendererString.c_str();
     case GL_VENDOR:
         static std::string cachedVendorString;
         if (cachedVendorString.empty()) {
-            cachedVendorString = std::string((char*)g_glesFuncs.glGetString(GL_VENDOR));
+            cachedVendorString = std::string((char*)g_glFuncs.glGetString(GL_VENDOR));
             if (!containsMobileGLDev(cachedVendorString)) {
                 cachedVendorString += " (SFPEW: MobileGL-Dev)";
             }
         }
         return (const GLubyte*)cachedVendorString.c_str();
     default:
-        return g_glesFuncs.glGetString(name);
+        return g_glFuncs.glGetString(name);
     }
 }
 
 const GLubyte* glGetStringi(GLenum name, GLuint index) {
     if (name != GL_EXTENSIONS) {
-        return g_glesFuncs.glGetStringi(name, index);
+        return g_glFuncs.glGetStringi(name, index);
     }
 
     switch (index) {
@@ -60,7 +59,7 @@ const GLubyte* glGetStringi(GLenum name, GLuint index) {
     case 7:
         return (const GLubyte*)"OpenGL20";
     default:
-        return g_glesFuncs.glGetStringi(name, index - 8);
+        return g_glFuncs.glGetStringi(name, index - 8);
     }
 }
 
@@ -79,13 +78,13 @@ void glGetIntegerv(GLenum pname, GLint* params) {
     case GL_NUM_EXTENSIONS:
         static GLint cachedNumExtensions = -1;
         if (cachedNumExtensions == -1) {
-            g_glesFuncs.glGetIntegerv(GL_NUM_EXTENSIONS, &cachedNumExtensions);
+            g_glFuncs.glGetIntegerv(GL_NUM_EXTENSIONS, &cachedNumExtensions);
             cachedNumExtensions += 8;
         }
         *params = cachedNumExtensions;
         break;
     default:
-        g_glesFuncs.glGetIntegerv(pname, params);
+        g_glFuncs.glGetIntegerv(pname, params);
         break;
     }
 }
@@ -103,7 +102,7 @@ void glGetFloatv(GLenum pname, GLfloat* params) {
         break;
     }
     default:
-        g_glesFuncs.glGetFloatv(pname, params);
+        g_glFuncs.glGetFloatv(pname, params);
         break;
     }
 }

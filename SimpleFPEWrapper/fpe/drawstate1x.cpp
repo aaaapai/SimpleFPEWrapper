@@ -1,6 +1,3 @@
-//
-// Created by Swung 0x48 on 2025/4/10.
-//
 #include "types.h"
 
 #define DEBUG 0

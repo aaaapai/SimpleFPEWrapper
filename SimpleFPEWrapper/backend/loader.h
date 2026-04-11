@@ -5,11 +5,11 @@
 #include <EGL/eglext.h>
 #include <string>
 
-#define SFPEW_EXTERNAL_GLES
+#define SFPEW_EXTERNAL_BACKENDGL
 
-#define GL_FUNC_TYPEDEF(type, name, ...) typedef type(SFPEW_EXTERNAL_GLES* name##_PTR)(__VA_ARGS__);
+#define GL_FUNC_TYPEDEF(type, name, ...) typedef type(SFPEW_EXTERNAL_BACKENDGL* name##_PTR)(__VA_ARGS__);
 
-#define GL_FUNC_DECL(name) GLES::name##_PTR name;
+#define GL_FUNC_DECL(name) BackendGL::name##_PTR name;
 #define EGL_FUNC_DECL(name) EGL::name##_PTR name;
 
 namespace SFPEW {
@@ -129,7 +129,7 @@ namespace SFPEW {
             EGL_FUNC_DECL(eglWaitSync)
         };
 
-        namespace GLES {
+        namespace BackendGL {
             GL_FUNC_TYPEDEF(void, glActiveTexture, GLenum texture)
             GL_FUNC_TYPEDEF(void, glAttachShader, GLuint program, GLuint shader)
             GL_FUNC_TYPEDEF(void, glBindAttribLocation, GLuint program, GLuint index, const GLchar* name)
@@ -613,21 +613,9 @@ namespace SFPEW {
             GL_FUNC_TYPEDEF(void, glBruh)
             GL_FUNC_TYPEDEF(void, glMultiDrawElementsBaseVertexEXT, GLenum mode, const GLsizei* count, GLenum type,
                             const void* const* indices, GLsizei drawcount, const GLint* basevertex)
-            /*
-                namespace Caps {
-                    struct GLESCaps {
-                        Version version;
-                        bool hasPersistentMapping;
-                        bool hasNorm16Texture;
+        } // namespace BackendGL
 
-                        Int uniformBufferOffsetAlignment;
-                    };
-                } // namespace Caps
-
-                extern Caps::GLESCaps g_glesCaps;*/ // TODO: migrate this to BackendObject
-        } // namespace GLES
-
-        struct GLESFunctionsTable {
+        struct BackendGLFunctionsTable {
             GL_FUNC_DECL(glActiveTexture)
             GL_FUNC_DECL(glAttachShader)
             GL_FUNC_DECL(glBindAttribLocation)
@@ -999,12 +987,12 @@ namespace SFPEW {
             GL_FUNC_DECL(glBruh)
         };
 
-        struct GLESCapabilities {
-            unsigned int GLESVersion[3]{3, 0, 0};
-            std::string GLESVersionString;
-            std::string GLESVendorString;
-            std::string GLESRendererString;
-            std::string GLESShadingLanguageVersionString;
+        struct BackendGLCapabilities {
+            unsigned int Version[3]{3, 0, 0};
+            std::string VersionString;
+            std::string VendorString;
+            std::string RendererString;
+            std::string ShadingLanguageVersionString;
             bool SupportsPersistentMapping = false;
             bool SupportsNorm16Texture = false;
             int UniformBufferOffsetAlignment = 256;
@@ -1012,9 +1000,10 @@ namespace SFPEW {
     } // namespace External
 
     namespace Utils::BackendLoader {
-        bool AcquireGLESFunctions(External::GLESFunctionsTable& funcs,
-                                  External::EGL::eglGetProcAddress_PTR procAddress);
+        bool AcquireBackendGLFunctions(External::BackendGLFunctionsTable& funcs,
+                                       External::EGL::eglGetProcAddress_PTR procAddress);
         bool AcquireEGLFunctions(External::EGLFunctionsTable& funcs, std::string customLibPath = "");
-        bool FillInGLESCapabilities(External::GLESCapabilities& caps, const External::GLESFunctionsTable& glesFuncs);
+        bool FillInBackendGLCapabilities(External::BackendGLCapabilities& caps,
+                                         const External::BackendGLFunctionsTable& glFuncs);
     } // namespace Utils::BackendLoader
 } // namespace SFPEW

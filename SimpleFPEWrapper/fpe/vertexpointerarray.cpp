@@ -1,6 +1,3 @@
-//
-// Created by Swung 0x48 on 2025/4/17.
-//
 #include "types.h"
 
 void vertex_pointer_array_t::reset() {
@@ -26,8 +23,7 @@ vertex_pointer_array_t vertex_pointer_array_t::normalize() {
         break;
     }
 
-    if (stride == 0)
-        that.stride = attributes[first_va_idx].stride;
+    if (stride == 0) that.stride = attributes[first_va_idx].stride;
 
     // if not valid starting pointer
     if (!(that.stride != 0 && that.starting_pointer != 0 && that.starting_pointer > (void*)that.stride)) {
@@ -44,12 +40,11 @@ vertex_pointer_array_t vertex_pointer_array_t::normalize() {
         bool enabled = ((enabled_pointers >> i) & 1);
         if (!enabled) continue;
 
-        auto &vp = that.attributes[i];
+        auto& vp = that.attributes[i];
 
         // check if pointer is a pointer rather than an offset
         if (that.stride > 0 && (uint64_t)vp.pointer > (uint64_t)that.stride)
-            vp.pointer =
-                    (const void*)((const uint64_t)vp.pointer - (const uint64_t)that.starting_pointer);
+            vp.pointer = (const void*)((const uint64_t)vp.pointer - (const uint64_t)that.starting_pointer);
 
         if (do_calc_stride)
             that.stride = std::max((uint64_t)stride, (uint64_t)vp.pointer + vp.size * type_size(vp.type));
@@ -60,7 +55,7 @@ vertex_pointer_array_t vertex_pointer_array_t::normalize() {
         bool enabled = ((enabled_pointers >> i) & 1);
         if (!enabled) continue;
 
-        auto &vp = that.attributes[i];
+        auto& vp = that.attributes[i];
         vp.stride = that.stride;
     }
     return that;

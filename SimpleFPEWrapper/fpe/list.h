@@ -1,9 +1,4 @@
-//
-// Created by hanji on 2025/3/28.
-//
-
-#ifndef MOBILEGLUES_PLUGIN_LIST_H
-#define MOBILEGLUES_PLUGIN_LIST_H
+#pragma once
 
 #include <GL/gl.h>
 #include <unordered_map>
@@ -174,5 +169,3 @@ GLAPI GLAPIENTRY void glEndList();
 GLAPI GLAPIENTRY void glCallList(GLuint list);
 GLAPI GLAPIENTRY void glCallLists(GLsizei n, GLenum type, const GLvoid* lists);
 GLAPI GLAPIENTRY void glListBase(GLuint base);
-
-#endif // MOBILEGLUES_PLUGIN_LIST_H

@@ -96,6 +96,9 @@ SFPEW_APIENTRY __eglMustCastToProperFunctionPointerType eglGetProcAddress(const 
     GETPROC(glEnableClientState, name)
     GETPROC(glDisableClientState, name)
     GETPROC(glGetFloatv, name)
+    GETPROC(glTexImage2D, name)
+    GETPROC(glTexSubImage2D, name)
+    GETPROC(glReadPixels, name)
     if (std::strcmp("glDeleteBuffersARB", name) == 0) {
         name = "glDeleteBuffers";
     } else if (std::strcmp("glGenBuffersARB", name) == 0) {

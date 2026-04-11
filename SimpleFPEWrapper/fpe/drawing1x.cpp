@@ -1,7 +1,3 @@
-//
-// Created by Swung 0x48 on 2025/4/1.
-//
-
 #include <glm/gtc/type_ptr.hpp>
 #include "drawing1x.h"
 #include "list.h"
@@ -59,15 +55,15 @@ void glEnd() {
 
         int prog_id = prog.get_program();
         if (prog_id < 0) {}
-        g_glesFuncs.glUseProgram(prog_id);
+        g_glFuncs.glUseProgram(prog_id);
 
         // VAO, VB
-        g_glesFuncs.glBindVertexArray(g_glstate.fpe_state.fpe_vao);
+        g_glFuncs.glBindVertexArray(g_glstate.fpe_state.fpe_vao);
 
-        g_glesFuncs.glBindBuffer(GL_ARRAY_BUFFER, g_glstate.fpe_state.fpe_vbo);
+        g_glFuncs.glBindBuffer(GL_ARRAY_BUFFER, g_glstate.fpe_state.fpe_vbo);
 
         auto vbbuf = vb.str();
-        g_glesFuncs.glBufferData(GL_ARRAY_BUFFER, vbbuf.size(), vbbuf.c_str(), GL_DYNAMIC_DRAW);
+        g_glFuncs.glBufferData(GL_ARRAY_BUFFER, vbbuf.size(), vbbuf.c_str(), GL_DYNAMIC_DRAW);
 
         // Vertex Pointer to ES
         g_glstate.send_vertex_attributes(va);
@@ -79,7 +75,7 @@ void glEnd() {
         // LOG_D("glEnd: glDrawArrays(%s, %d, %d), vb = %d, vb size = %d", glEnumToString(s.primitive), 0,
         // s.vertex_count,
         //      g_glstate.fpe_state.fpe_vbo, vbbuf.size())
-        g_glesFuncs.glDrawArrays(s.primitive, 0, s.vertex_count);
+        g_glFuncs.glDrawArrays(s.primitive, 0, s.vertex_count);
     }
 
     SET_PREV_PROGRAM

@@ -1,9 +1,4 @@
-//
-// Created by Swung 0x48 on 2025/2/11.
-//
-
-#ifndef MOBILEGLUES_TYPES_H
-#define MOBILEGLUES_TYPES_H
+#pragma once
 
 #include <GL/gl.h>
 #include "defines.h"
@@ -224,5 +219,3 @@ struct glstate_t {
 
     bool send_vertex_attributes(const vertex_pointer_array_t& va) const;
 };
-
-#endif // MOBILEGLUES_TYPES_H

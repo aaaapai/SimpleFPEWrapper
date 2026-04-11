@@ -6,7 +6,7 @@
 
 #define SFPEW_APIENTRY __attribute__((visibility("default"))) extern "C"
 extern SFPEW::External::EGLFunctionsTable g_eglFuncs;
-extern SFPEW::External::GLESFunctionsTable g_glesFuncs;
+extern SFPEW::External::BackendGLFunctionsTable g_glFuncs;
 
 SFPEW_APIENTRY const GLubyte* glGetString(GLenum name);
 SFPEW_APIENTRY const GLubyte* glGetStringi(GLenum name, GLuint index);

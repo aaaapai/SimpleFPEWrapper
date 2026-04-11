@@ -1,7 +1,3 @@
-//
-// Created by Swung 0x48 on 2025/2/8.
-//
-
 #include "transformation.h"
 #include <glm/gtc/type_ptr.hpp>
 #include "list.h"

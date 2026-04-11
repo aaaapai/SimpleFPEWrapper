@@ -1,6 +1,3 @@
-//
-// Created by hanji on 2025/3/29.
-//
 #include "pointer_utils.h"
 #include <GL/gl.h>
 

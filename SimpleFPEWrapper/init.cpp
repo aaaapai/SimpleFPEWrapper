@@ -2,7 +2,7 @@
 #include "fpe/fpe.hpp"
 
 SFPEW::External::EGLFunctionsTable g_eglFuncs;
-SFPEW::External::GLESFunctionsTable g_glesFuncs;
+SFPEW::External::BackendGLFunctionsTable g_glFuncs;
 
 void Init() {
     std::string eglLibName;
@@ -18,10 +18,10 @@ void Init() {
         throw std::runtime_error("Failed to acquire EGL functions");
     }
 
-    if (!SFPEW::Utils::BackendLoader::AcquireGLESFunctions(g_glesFuncs, g_eglFuncs.eglGetProcAddress) ||
-        g_glesFuncs.glGetString == nullptr) {
-        throw std::runtime_error("Failed to acquire GLES functions");
-    } // FIXME: actually we should acquire gles functions after egl initialization
+    if (!SFPEW::Utils::BackendLoader::AcquireBackendGLFunctions(g_glFuncs, g_eglFuncs.eglGetProcAddress) ||
+        g_glFuncs.glGetString == nullptr) {
+        throw std::runtime_error("Failed to acquire BackendGL functions");
+    } // FIXME: actually we should acquire gl functions after egl initialization
 
     init_fpe();
 }

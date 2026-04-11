@@ -1,7 +1,3 @@
-//
-// Created by Swung 0x48 on 2025/2/10.
-//
-
 #include "vertexpointer.h"
 #include "list.h"
 #include "fpe.hpp"

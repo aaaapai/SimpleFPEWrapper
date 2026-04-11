@@ -1,9 +1,4 @@
-//
-// Created by Swung 0x48 on 2025/2/8.
-//
-
-#ifndef MOBILEGLUES_STATE_H
-#define MOBILEGLUES_STATE_H
+#pragma once
 
 #include <GL/gl.h>
 
@@ -37,5 +32,3 @@ extern "C"
 #ifdef __cplusplus
 }
 #endif
-
-#endif // MOBILEGLUES_STATE_H

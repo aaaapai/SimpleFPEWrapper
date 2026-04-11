@@ -1,6 +1,3 @@
-//
-// Created by Swung 0x48 on 2025/4/11.
-//
 #include "types.h"
 #include "transformation.h"
 #include "../init.h"
@@ -19,47 +16,47 @@ void glstate_t::send_uniforms(int program) {
     print_matrix(proj);
 
     // TODO: detect change and only set dirty bits here
-    g_glesFuncs.glBindVertexArray(fpe_state.fpe_vao);
+    g_glFuncs.glBindVertexArray(fpe_state.fpe_vao);
 
-    GLint mvmat = g_glesFuncs.glGetUniformLocation(program, "ModelViewMat");
+    GLint mvmat = g_glFuncs.glGetUniformLocation(program, "ModelViewMat");
 
-    //    GLint projmat = g_glesFuncs.glGetUniformLocation(program, "ProjMat");
+    //    GLint projmat = g_glFuncs.glGetUniformLocation(program, "ProjMat");
     //
-    GLint mat_id = g_glesFuncs.glGetUniformLocation(program, "ModelViewProjMat");
+    GLint mat_id = g_glFuncs.glGetUniformLocation(program, "ModelViewProjMat");
 
     const auto mat = proj * mv;
-    g_glesFuncs.glUniformMatrix4fv(mvmat, 1, GL_FALSE,
-                                   glm::value_ptr(fpe_uniform.transformation.matrices[matrix_idx(GL_MODELVIEW)]));
+    g_glFuncs.glUniformMatrix4fv(mvmat, 1, GL_FALSE,
+                                 glm::value_ptr(fpe_uniform.transformation.matrices[matrix_idx(GL_MODELVIEW)]));
 
-    //    g_glesFuncs.glUniformMatrix4fv(projmat, 1, GL_FALSE,
+    //    g_glFuncs.glUniformMatrix4fv(projmat, 1, GL_FALSE,
     //    glm::value_ptr(fpe_uniform.transformation.matrices[matrix_idx(GL_PROJECTION)]));
-    g_glesFuncs.glUniformMatrix4fv(mat_id, 1, GL_FALSE, glm::value_ptr(mat));
+    g_glFuncs.glUniformMatrix4fv(mat_id, 1, GL_FALSE, glm::value_ptr(mat));
 
-    g_glesFuncs.glUniform1i(g_glesFuncs.glGetUniformLocation(program, "Sampler0"), 0);
+    g_glFuncs.glUniform1i(g_glFuncs.glGetUniformLocation(program, "Sampler0"), 0);
 
     if (fpe_state.fpe_bools.fog_enable) {
-        GLint fogcolor_id = g_glesFuncs.glGetUniformLocation(program, "fogParam.color");
+        GLint fogcolor_id = g_glFuncs.glGetUniformLocation(program, "fogParam.color");
 
         // LOG_D("fogcolor_id = %d", fogcolor_id)
-        g_glesFuncs.glUniform4fv(fogcolor_id, 1, glm::value_ptr(fpe_uniform.fog_color));
+        g_glFuncs.glUniform4fv(fogcolor_id, 1, glm::value_ptr(fpe_uniform.fog_color));
 
-        GLint fogdensity_id = g_glesFuncs.glGetUniformLocation(program, "fogParam.density");
+        GLint fogdensity_id = g_glFuncs.glGetUniformLocation(program, "fogParam.density");
 
-        g_glesFuncs.glUniform1f(fogdensity_id, fpe_uniform.fog_density);
+        g_glFuncs.glUniform1f(fogdensity_id, fpe_uniform.fog_density);
 
-        GLint fogstart_id = g_glesFuncs.glGetUniformLocation(program, "fogParam.start");
+        GLint fogstart_id = g_glFuncs.glGetUniformLocation(program, "fogParam.start");
 
-        g_glesFuncs.glUniform1f(fogstart_id, fpe_uniform.fog_start);
+        g_glFuncs.glUniform1f(fogstart_id, fpe_uniform.fog_start);
 
-        GLint fogend_id = g_glesFuncs.glGetUniformLocation(program, "fogParam.end");
+        GLint fogend_id = g_glFuncs.glGetUniformLocation(program, "fogParam.end");
 
-        g_glesFuncs.glUniform1f(fogend_id, fpe_uniform.fog_end);
+        g_glFuncs.glUniform1f(fogend_id, fpe_uniform.fog_end);
     }
 
     if (fpe_state.fpe_bools.alpha_test_enable) {
-        GLint alpharef_id = g_glesFuncs.glGetUniformLocation(program, "alpharef");
+        GLint alpharef_id = g_glFuncs.glGetUniformLocation(program, "alpharef");
 
-        g_glesFuncs.glUniform1f(alpharef_id, fpe_uniform.alpha_ref);
+        g_glFuncs.glUniform1f(alpharef_id, fpe_uniform.alpha_ref);
     }
 }
 
@@ -180,9 +177,9 @@ bool glstate_t::send_vertex_attributes(const vertex_pointer_array_t& va) const {
 
         auto& vp = va.attributes[i];
         if (enabled) {
-            g_glesFuncs.glVertexAttribPointer(va.cidx(i), vp.size, vp.type, vp.normalized, vp.stride, vp.pointer);
+            g_glFuncs.glVertexAttribPointer(va.cidx(i), vp.size, vp.type, vp.normalized, vp.stride, vp.pointer);
 
-            g_glesFuncs.glEnableVertexAttribArray(va.cidx(i));
+            g_glFuncs.glEnableVertexAttribArray(va.cidx(i));
 
             // LOG_D("attrib #%d, cidx #%u: type = %s, size = %d, stride = %d, usage = %s, ptr = %p", i, va.cidx(i),
             //      glEnumToString(vp.type), vp.size, vp.stride, glEnumToString(vp.usage), vp.pointer)
@@ -195,7 +192,7 @@ bool glstate_t::send_vertex_attributes(const vertex_pointer_array_t& va) const {
                     // i,
                     //      va.cidx(i), glEnumToString(vp.type), glEnumToString(vp.usage), v[0], v[1], v[2], v[3])
 
-                    g_glesFuncs.glVertexAttrib4fv(va.cidx(i), glm::value_ptr(v));
+                    g_glFuncs.glVertexAttrib4fv(va.cidx(i), glm::value_ptr(v));
                 }
                 break;
             case GL_NORMAL_ARRAY:
@@ -204,7 +201,7 @@ bool glstate_t::send_vertex_attributes(const vertex_pointer_array_t& va) const {
                     // LOG_D("attrib #%d, cidx #%u: type = %s, usage = %s, value = (%.2f, %.2f, %.2f) (disabled)", i,
                     //      va.cidx(i), glEnumToString(vp.type), glEnumToString(vp.usage), v[0], v[1], v[2])
 
-                    g_glesFuncs.glVertexAttrib3fv(va.cidx(i), glm::value_ptr(v));
+                    g_glFuncs.glVertexAttrib3fv(va.cidx(i), glm::value_ptr(v));
                 }
                 break;
             default:
@@ -212,7 +209,7 @@ bool glstate_t::send_vertex_attributes(const vertex_pointer_array_t& va) const {
                 break;
             }
 
-            if (va.cidx(i) != ~0u) g_glesFuncs.glDisableVertexAttribArray(va.cidx(i));
+            if (va.cidx(i) != ~0u) g_glFuncs.glDisableVertexAttribArray(va.cidx(i));
         }
     }
 

@@ -1,7 +1,3 @@
-//
-// Created by Swung 0x48 on 2025/3/18.
-//
-
 #include "fpe_shadergen.h"
 #include "types.h"
 #include <format>
@@ -1504,17 +1500,17 @@ int program_t::get_program() {
 int program_t::compile_shader(GLenum shader_type, const char* src) {
     static char compile_info[1024];
 
-    int shader = g_glesFuncs.glCreateShader(shader_type);
+    int shader = g_glFuncs.glCreateShader(shader_type);
 
-    g_glesFuncs.glShaderSource(shader, 1, &src, NULL);
+    g_glFuncs.glShaderSource(shader, 1, &src, NULL);
 
-    g_glesFuncs.glCompileShader(shader);
+    g_glFuncs.glCompileShader(shader);
 
     int success = 0;
-    g_glesFuncs.glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
+    g_glFuncs.glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
 
     if (!success) {
-        g_glesFuncs.glGetShaderInfoLog(shader, 1024, NULL, compile_info);
+        g_glFuncs.glGetShaderInfoLog(shader, 1024, NULL, compile_info);
 
         // LOG_E("%s: %s shader compile error: %s\nsrc:\n%s", __func__,
         //      (shader_type == GL_VERTEX_SHADER) ? "vertex" : "fragment", compile_info, src);
@@ -1530,19 +1526,19 @@ int program_t::compile_shader(GLenum shader_type, const char* src) {
 int program_t::link_program(GLuint vs, GLuint fs) {
     static char compile_info[1024];
 
-    int program = g_glesFuncs.glCreateProgram();
+    int program = g_glFuncs.glCreateProgram();
 
-    g_glesFuncs.glAttachShader(program, vs);
+    g_glFuncs.glAttachShader(program, vs);
 
-    g_glesFuncs.glAttachShader(program, fs);
+    g_glFuncs.glAttachShader(program, fs);
 
-    g_glesFuncs.glLinkProgram(program);
+    g_glFuncs.glLinkProgram(program);
 
     int success = 0;
-    g_glesFuncs.glGetProgramiv(program, GL_LINK_STATUS, &success);
+    g_glFuncs.glGetProgramiv(program, GL_LINK_STATUS, &success);
 
     if (!success) {
-        g_glesFuncs.glGetProgramInfoLog(program, 1024, NULL, compile_info);
+        g_glFuncs.glGetProgramInfoLog(program, 1024, NULL, compile_info);
 
         // LOG_E("program link error: %s", compile_info);
 #if DEBUG || GLOBAL_DEBUG

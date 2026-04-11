@@ -1,7 +1,3 @@
-//
-// Created by hanji on 2025/3/28.
-//
-
 #include "list.h"
 #include "pointer_utils.h"
 #include "fpe.hpp"

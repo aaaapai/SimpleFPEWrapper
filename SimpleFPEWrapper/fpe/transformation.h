@@ -1,9 +1,4 @@
-//
-// Created by Swung 0x48 on 2025/2/8.
-//
-
-#ifndef FOLD_CRAFT_LAUNCHER_TRANSFORMATION_H
-#define FOLD_CRAFT_LAUNCHER_TRANSFORMATION_H
+#pragma once
 
 #include "GL/gl.h"
 #include <glm/glm.hpp>
@@ -39,5 +34,3 @@ extern "C"
 #ifdef __cplusplus
 }
 #endif
-
-#endif // FOLD_CRAFT_LAUNCHER_TRANSFORMATION_H

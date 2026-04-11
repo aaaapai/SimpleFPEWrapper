@@ -1,7 +1,3 @@
-//
-// Created by Swung 0x48 on 2025/2/8.
-//
-
 #include "state.h"
 #include "fpe.hpp"
 #include <glm/gtc/type_ptr.hpp>
@@ -53,7 +49,7 @@ void glEnable(GLenum cap) {
 
     if (hijack_fpe_states(cap, true, &g_glstate.fpe_state.fpe_bools)) return;
 
-    g_glesFuncs.glEnable(cap);
+    g_glFuncs.glEnable(cap);
 }
 
 void glDisable(GLenum cap) {
@@ -64,7 +60,7 @@ void glDisable(GLenum cap) {
 
     if (hijack_fpe_states(cap, false, &g_glstate.fpe_state.fpe_bools)) return;
 
-    g_glesFuncs.glDisable(cap);
+    g_glFuncs.glDisable(cap);
 }
 
 void glClientActiveTexture(GLenum texture) {
