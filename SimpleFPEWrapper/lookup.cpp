@@ -104,29 +104,6 @@ SFPEW_APIENTRY __eglMustCastToProperFunctionPointerType eglGetProcAddress(const 
     GETPROC(glEnableClientState, name)
     GETPROC(glDisableClientState, name)
     GETPROC(glGetFloatv, name)
-    if (std::strcmp("glDeleteBuffersARB", name) == 0) {
-        name = "glDeleteBuffers";
-    } else if (std::strcmp("glGenBuffersARB", name) == 0) {
-        name = "glGenBuffers";
-    } else if (std::strcmp("glBindBufferARB", name) == 0) {
-        name = "glBindBuffer";
-    } else if (std::strcmp("glBufferDataARB", name) == 0) {
-        name = "glBufferData";
-    } else if (std::strcmp("glBufferSubDataARB", name) == 0) {
-        name = "glBufferSubData";
-    } else if (std::strcmp("glGetBufferSubDataARB", name) == 0) {
-        name = "glGetBufferSubData";
-    } else if (std::strcmp("glMapBufferARB", name) == 0) {
-        name = "glMapBuffer";
-    } else if (std::strcmp("glUnmapBufferARB", name) == 0) {
-        name = "glUnmapBuffer";
-    } else if (std::strcmp("glGetBufferParameterivARB", name) == 0) {
-        name = "glGetBufferParameteriv";
-    } else if (std::strcmp("glGetBufferPointervARB", name) == 0) {
-        name = "glGetBufferPointerv";
-    } else if (std::strcmp("glIsBufferARB", name) == 0) {
-        name = "glIsBuffer";
-    }
 
     __eglMustCastToProperFunctionPointerType ptr = g_eglFuncs.eglGetProcAddress(name);
     if (!ptr) {
