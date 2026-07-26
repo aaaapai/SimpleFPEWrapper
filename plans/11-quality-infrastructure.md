@@ -2,7 +2,7 @@
 
 **目标**:建立支撑 S1–S10 验收的测试与质量基础设施:headless 渲染 harness、金图对比、状态快照、Sanitizer、CI 矩阵、生成式 API manifest、性能基准。本文件是各阶段"退出标准"里测试项的实现载体。
 
-**现状(2026-07-26)**:CTest 套件 625 项全绿(7 个 smoke + 618 个 vendored piglit shader_test),GCC/Clang + ASan/UBSan CI 已建,api-manifest 生成式校验已接入。piglit 子集经自研 mini-runner(`tests/piglit_runner.c`,250x250 pbuffer,全部经 eglGetProcAddress)驱动,覆盖 glsl-1.10/1.20 的 execution+linker 测试;6 个 glslang/Mesa 语义差异记录于 `tests/piglit/KNOWN_DEVIATIONS.txt` 并以 WILL_FAIL 跟踪。金图系统、状态快照器、TSan、微基准未落地。
+**现状(2026-07-26)**:CTest 套件 625 项全绿(7 个 smoke + 618 个 vendored piglit shader_test),GCC/Clang + ASan/UBSan CI 已建,api-manifest 生成式校验已接入。piglit 子集经自研 mini-runner(`tests/piglit_runner.c`,250x250 pbuffer,全部经 eglGetProcAddress)驱动,覆盖 glsl-1.10/1.20 的 execution+linker 测试;6 个 glslang/Mesa 语义差异记录于 `tests/piglit/KNOWN_DEVIATIONS.txt` 并以 WILL_FAIL 跟踪。金图系统、状态快照器、TSan 未落地;Q5 微基准已落地(场景基准未做)。
 
 ## 组件
 
@@ -29,7 +29,8 @@
 - [ ] 取代 `fpe_implementation_progress.yaml`(归档)。
 
 ### Q5 性能基准(随 S2/S6 落地)
-- [ ] 微基准:即时模式顶点吞吐、显示列表回放(合批收益)、program 缓存命中路径;
+- [x] 微基准:`tests/bench_fpe.c`(`-DSFPEW_BENCH=ON` 注册为 ctest,`ctest -L bench -V`;`SFPEW_BENCH_SCALE` 缩放迭代)——即时模式顶点吞吐、显示列表回放、program 缓存稳态/切换、GLSL 翻译耗时。
+  首轮基线(GTX 1660 SUPER,NVIDIA GLES3,2026-07-26):immediate 0.63 Mvert/s(1590 ns/vert);dlist 回放 speedup **0.99x——合批收益为零,回放仍逐命令重放,S6 优化点**;progcache 18.6 μs/draw 稳态 / 20.0 μs 双 key 切换(命中路径差值健康);translate 1.09 ms/shader(**印证 plans/09 的源码 hash 缓存必要性**);
 - [ ] 场景基准:MC 风格 chunk 重放帧时间(录制一段真实调用流回放——考虑用 apitrace 采一份 1.7.10 trace 作固定负载);
 - [ ] 回归门槛:关键基准 ±5% 报警(S6 合批改造、S1 `-ffast-math` 移除都靠它裁决)。
 
