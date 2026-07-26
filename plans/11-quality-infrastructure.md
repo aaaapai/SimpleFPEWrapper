@@ -2,28 +2,28 @@
 
 **目标**:建立支撑 S1–S10 验收的测试与质量基础设施:headless 渲染 harness、金图对比、状态快照、Sanitizer、CI 矩阵、生成式 API manifest、性能基准。本文件是各阶段"退出标准"里测试项的实现载体。
 
-**现状**:全部为零(批判员判定 Quality Gates not-started)——无 CTest、无 CI、无 ASan/UBSan、无 headless 渲染器、无生成式 manifest、无双驱动测试;shader 失败日志走 stdout 且 Android logcat 重定向被注释(`android_debug.h:12`,S1 修复)。
+**现状(2026-07-26)**:CTest 套件 625 项全绿(7 个 smoke + 618 个 vendored piglit shader_test),GCC/Clang + ASan/UBSan CI 已建,api-manifest 生成式校验已接入。piglit 子集经自研 mini-runner(`tests/piglit_runner.c`,250x250 pbuffer,全部经 eglGetProcAddress)驱动,覆盖 glsl-1.10/1.20 的 execution+linker 测试;6 个 glslang/Mesa 语义差异记录于 `tests/piglit/KNOWN_DEVIATIONS.txt` 并以 WILL_FAIL 跟踪。金图系统、状态快照器、TSan、微基准未落地。
 
 ## 组件
 
 ### Q1 构建与静态质量(随 S1 落地)
-- [ ] CI(GitHub Actions 或本地脚本起步):Linux GCC/Clang × Debug/Release 四组合;Android NDK arm64 交叉构建;
+- [x] CI(GitHub Actions):Linux GCC/Clang 矩阵 + ASan/UBSan 作业(`.github/workflows/ci.yml`);Android NDK arm64 交叉构建待补;
 - [ ] 警告即错误(项目代码,3rdparty 豁免)——S1 清零后开启;
 - [ ] clang-tidy 基线集(bugprone-*, cert-* 精选),增量执行。
 
 ### Q2 Headless 渲染 harness(S2 需要,尽早)
-- [ ] EGL surfaceless/pbuffer + Mesa llvmpipe(CI)/真实 GPU(本地)双模;GLES 3.0 context;
-- [ ] wrapper 以"被测库"形态加载:测试进程 dlopen `libSimpleFPEWrapper.so` 并全部经 `eglGetProcAddress`(不直连符号),复刻真实使用形态;
+- [x] EGL surfaceless/pbuffer + llvmpipe(CI)/真实 GPU(本地)双模;GLES 3.0 context;SKIP_RETURN_CODE 77 无设备降级;
+- [x] wrapper 以"被测库"形态加载:smoke_render / piglit_runner 均 dlopen + 全量 `eglGetProcAddress` 解析;
 - [ ] 状态快照器:关键后端状态(program/VAO/buffer/texture 绑定、enable 集)+ wrapper 影子状态的结构化 dump 与 diff;
 - [ ] 金图系统:PNG 输出、逐像素容差比较(默认容差 0,光照/雾类场景按通道 ±2)、失败时输出 diff 图 + 当帧 shader 源码与编译日志(利用 S1 日志层);金图按"驱动 profile"分目录(llvmpipe 与移动 GPU 光栅差异)。
 
 ### Q3 Sanitizer 与动态检查(随 S2 落地)
-- [ ] ASan+UBSan 测试作业(CPU 侧全量单测 + llvmpipe 渲染测试);
+- [x] ASan+UBSan 测试作业(CI `linux-gcc-asan`,detect_leaks=0);
 - [ ] S2 修复的每个缺陷都要有 Sanitizer 可见的复现测试(修复前红);
 - [ ] TSan 作业(S7 起,mock 后端跑并发用例)。
 
 ### Q4 生成式 API Manifest(随 S3 落地,S10 定版)
-- [ ] 脚本解析 GETPROC 表 + 导出符号 + `include/GL` 头 → `docs/api-manifest.{md,json}`,状态:exported / implemented / tested / deferred / unsupported(+ 备注偏差);
+- [x] 脚本解析 GETPROC 表 + 导出符号 → `docs/api-manifest.{md,json}`(`tools/gen_api_manifest.py`,CTest `api_manifest_current` 强制同步);
 - [ ] "tested" 状态由测试标注反哺(测试用例声明覆盖的入口点,脚本聚合);
 - [ ] CI 校验:与 gl.xml 2.1 profile 对比,新增/丢失符号必须显式改 manifest 才能过;
 - [ ] 取代 `fpe_implementation_progress.yaml`(归档)。
