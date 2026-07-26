@@ -47,6 +47,7 @@
 
 ### 9.3 混合管线语义(GL 2.0 的难点)
 - [ ] 用户 program(VS+FS 齐全)current 时:FPE 完全让路(现有拦截判定 program==0 已正确),但内建 uniform/attribute 上传通道必须激活。
+- [x] **完整 program + 固定管线顶点供给**(2026-07-26,RenderDoc 实测驱动):绑定用户 program 时,glVertexPointer 系数组 / glBegin-glEnd 顶点喂入其 fpe_* 属性(fpe_user_vao,按名解析 location 并缓存),GL_QUADS/QUAD_STRIP/POLYGON 转换,glDrawElements CPU 索引处理;此前这类 draw 被直通(GLES 吞掉 QUADS)或被 FPE 内部 program 顶替(OptiFine composite 变成纯 blit)。VS 输入不再带硬编码 layout(location),glBindAttribLocation(mc_Entity 模式)得以生效。测试:smoke_mixed_pipeline(R/B 交换着色器证明用户 shader 真正执行)。
 - [ ] **FS-only program**:GL 2.0 允许——固定管线顶点处理 + 用户 FS。方案:FPE 生成配套 VS(现有 shadergen 的 VS 半边)+ 用户翻译后 FS 链接;program hash 引入"用户 FS id"维度。
 - [ ] **VS-only program**:用户 VS + 固定管线片元(texenv/fog/alpha)——对称方案,FPE 生成 FS 半边。
 - [ ] varying 匹配规则:用户半边引用的 `gl_TexCoord[]` 等内建 varying 与生成半边对接;命名/位置以 SPIRV-Cross 的输出规则为准(reflection 驱动,FPE 生成的半边跟随该命名约定);不匹配时按链接错误报告。
