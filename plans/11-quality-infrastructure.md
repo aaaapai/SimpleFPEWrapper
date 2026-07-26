@@ -30,7 +30,14 @@
 
 ### Q5 性能基准(随 S2/S6 落地)
 - [x] 微基准:`tests/bench_fpe.c`(`-DSFPEW_BENCH=ON` 注册为 ctest,`ctest -L bench -V`;`SFPEW_BENCH_SCALE` 缩放迭代)——即时模式顶点吞吐、显示列表回放、program 缓存稳态/切换、GLSL 翻译耗时。
-  首轮基线(GTX 1660 SUPER,NVIDIA GLES3,2026-07-26):immediate 0.63 Mvert/s(1590 ns/vert);dlist 回放 speedup **0.99x——合批收益为零,回放仍逐命令重放,S6 优化点**;progcache 18.6 μs/draw 稳态 / 20.0 μs 双 key 切换(命中路径差值健康);translate 1.09 ms/shader(**印证 plans/09 的源码 hash 缓存必要性**);
+  首轮基线(GTX 1660 SUPER,NVIDIA GLES3,2026-07-26,14 项):
+  - immediate 0.62 Mvert/s(1607 ns/vert)vs clientarrays 29.6 Mvert/s —— **即时模式路径比 client-array 路径慢 ~48x,纯 wrapper CPU 开销,GUI/粒子场景优化点**;
+  - dlist 回放 speedup **1.00x——合批收益为零,回放仍逐命令重放,S6 优化点**;
+  - tinybatch 19.2 μs/batch ≈ progcache 稳态 19.4 μs/draw ≈ texswitch 21.9 μs/draw —— **每 draw 固定开销 ~19 μs(commit_fpe_state_on_draw),小批次场景的主瓶颈**;
+  - gatherarrays 43.4 Mvert/s **快于** interleaved 29.6 Mvert/s —— 反直觉,交错路径疑有多余拷贝,待查;
+  - drawelements 61.9 Midx/s;matrixops 1818 ns/组(push+translate+rotate+pop,~450 ns/调用,偏高);getter 456 ns/次(TLS/锁开销,MC mod 会高频调用);
+  - texupload 1.96 μs/16x16 sub(lightmap 模式)、2.7 GB/s 整图;readpixels 44.7 μs/256x256;
+  - translate 1.10 ms/shader、progcompile 3.85 ms/program 首触 —— **印证 plans/09 源码 hash 缓存与 program 预热的必要性(移动端首帧卡顿源)**;
 - [ ] 场景基准:MC 风格 chunk 重放帧时间(录制一段真实调用流回放——考虑用 apitrace 采一份 1.7.10 trace 作固定负载);
 - [ ] 回归门槛:关键基准 ±5% 报警(S6 合批改造、S1 `-ffast-math` 移除都靠它裁决)。
 
