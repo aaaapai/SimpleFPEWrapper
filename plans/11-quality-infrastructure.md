@@ -38,6 +38,14 @@
   - drawelements 61.9 Midx/s;matrixops 1818 ns/组(push+translate+rotate+pop,~450 ns/调用,偏高);getter 456 ns/次(TLS/锁开销,MC mod 会高频调用);
   - texupload 1.96 μs/16x16 sub(lightmap 模式)、2.7 GB/s 整图;readpixels 44.7 μs/256x256;
   - translate 1.10 ms/shader、progcompile 3.85 ms/program 首触 —— **印证 plans/09 源码 hash 缓存与 program 预热的必要性(移动端首帧卡顿源)**;
+- [x] **性能冲刺后基线(同机同环境,2026-07-26,perf 分支 99b617a..dc452e3 六个提交)**——根因是 glvnd 桌面上 `eglGetCurrentContext` 每次 ~425ns(getpid fork 检查 + dispatch 互斥),而旧设计每次 `g_glstate` 宏展开都调用它(profile 中占全部周期 ~83%)。改造为"每导出入口恰一次严格解析 + TLS 快照下游复用 + Begin/End 顶点数据钉扎"(docs/context-model.md),并叠加 draw 路径/显示列表/翻译器优化:
+  - immediate **24.2 Mvert/s(41 ns/vert,39x)**;dlist 回放 **188 Mvert/s(5.3 ns/vert,speedup 7.8x)**——glEndList 把 Begin/End 流编译成 baked draw(一次 ring 上传 + 一次 draw,相邻同布局 run 合并);
+  - tinybatch **4.4 μs**、progcache 稳态 **4.4 μs**、texswitch **5.5 μs**(约 4x)——入口单解析 + 后端 VAO/element 绑定影子(消除 guard 每 draw 两次同步 glGetIntegerv)+ client 数组经持久映射 ring 上传(不再每 draw glBufferData 孤儿化);
+  - clientarrays **143 Mvert/s(7.0 ns/vert,5.4x)**——已交错布局直通(跳过逐元素 gather 重打包);gatherarrays 60.3 Mvert/s;drawelements 115 Midx/s;
+  - translate 重复源码 **~0 ms**(源码哈希 memoization,16MB 上限;首触不变 ~1.1ms);progcompile 首触 0.19 ms;
+  - matrixops 450 ns/调用、getter 433 ns 为严格合同下限(= 1 次 eglGetCurrentContext);**`SFPEW_RELAXED_CONTEXT=1`**(每线程单上下文承诺,MC 启动器均满足)下 matrixops **25 ns/调用**、getter **7.9 ns**、tinybatch 3.1 μs——Android 真机上 eglGetCurrentContext 本身即为 TLS 读,严格模式即接近该水平;
+  - advance() 改为缓存 span 拷贝计划(92 字节 memcmp 验证);终态 perf:除合规入口解析外,wrapper 无 >5% 单点热点(memmove 4%、advance 2%、program_hash 0.8%);
+  - 全程 ctest 665/665 全绿(严格 + relaxed 两种模式),对照两轮对抗性审查(入口锚点完备性、钉扎语义、绑定影子一致性、编译回放语义)。
 - [ ] 场景基准:MC 风格 chunk 重放帧时间(录制一段真实调用流回放——考虑用 apitrace 采一份 1.7.10 trace 作固定负载);
 - [ ] 回归门槛:关键基准 ±5% 报警(S6 合批改造、S1 `-ffast-math` 移除都靠它裁决)。
 
