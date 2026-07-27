@@ -7,7 +7,7 @@ the measurement, best of 3 (harness: `tests/bench_cmp_gl4es.c`).
 | phase | SFPEW | gl4es | ratio |
 |---|---|---|---|
 | tinybatch (1 quad per Begin/End) | 3.51 us/batch | 0.35 us/batch | 10.0x slower |
-| dlist replay | 87.5 ns/vert | 9.1 ns/vert | 9.6x slower |
+| dlist replay | 8.7 ns/vert | 9.1 ns/vert | 1.05x FASTER (was 9.6x slower) |
 | clientarrays | 34.2 ns/vert | 6.0 ns/vert | 5.7x slower |
 | drawelements | 14.0 ns/idx | 3.9 ns/idx | 3.6x slower |
 | texswitch | 4.04 us/draw | 2.28 us/draw | 1.8x slower |
@@ -35,6 +35,19 @@ number.
    crosses a quarter of the ring; a 144-byte tiny batch almost never does.
 4. **Uniform re-submission.** All 19 `glUniform*` calls in `send_uniforms`
    are already gated on a change flag.
+
+5. **Vertex attribute setup per draw.** Already cached: `send_vertex_attributes`
+   returns early on `!va.dirty`, and each attribute's format/binding is
+   compared against `fpe_vertex_attributes` before being re-sent.
+6. **Deferred state restore, flushed from `sfpewEnsureBackend`.** Implemented
+   and reverted: no measurable gain (tinybatch 3.51 -> 3.34 us, within
+   noise). The reason is structural - the fixed-function entry points call
+   `sfpewEnsureBackend` too, so `glVertex3f`/`glEnd` flush the deferred state
+   between draws and it is restored and re-bound exactly as before. A working
+   version has to place the flush only on the non-fixed-function entry points
+   (passthrough, getters, user-program draws), which is the exhaustive
+   enumeration that makes this option risky: a missed observer is silent
+   state corruption, not a test failure.
 
 ## Where the time actually goes
 
@@ -64,13 +77,11 @@ Two candidate directions, both real changes rather than tuning:
   This removes both the restores and the re-binds. The risk is completeness:
   the set of observing entry points has to be exhaustive, and missing one
   is a hard-to-trace state corruption rather than a visible failure.
-- **Display-list compilation.** gl4es compiles a list into one VBO and
-  replays it as a single draw, which is why its dlist is 13x faster than its
-  own immediate mode (117 -> 9.1) while ours is the same as immediate
-  (85.9 vs 87.5) - list replay gets no batching benefit today. The existing
-  `captured_draw_arrays_cmd_t` only covers client-array `glDrawArrays`, not
-  `glBegin`/`glEnd` blocks. Bounded and lower-risk than deferred restore;
-  addresses the dlist row only.
+- **Display-list compilation.** DONE (40d23a7). `glBegin` suppresses
+  per-call recording and `glEnd` emits one command holding the accumulated
+  vertex block, so replay is one upload and one draw instead of a command per
+  vertex attribute call. dlist 87.5 -> 8.7 ns/vert, which overtakes gl4es
+  (9.1). Covered by `smoke_list_immediate`.
 
 ## Caveats on the numbers
 
