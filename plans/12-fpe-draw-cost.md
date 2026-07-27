@@ -73,7 +73,51 @@ number.
    rotating offset is what prevents that, so the per-draw `glBindVertexBuffer`
    it forces is buying something real and is not the cost to remove.
 
-## Where the time actually goes
+## Remaining gaps (post deferred-restore)
+
+| phase | SFPEW | gl4es | ratio | why |
+|---|---|---|---|---|
+| tinybatch | 0.89 us | 0.35 us | 2.6x | driver calls per tiny draw (see below) |
+| drawelements | 8.3 ns/idx | 3.9 ns/idx | 2.1x | ring-buffer upload (see below) |
+| clientarrays | 7-9 ns/vert | 6.0 ns/vert | 1.2-1.5x | same as drawelements |
+| texswitch | 3.5 us | 2.28 us | 1.5x | glBindTexture passthrough difference |
+
+All are structural. Profiling on the same machine, same flags:
+
+**tinybatch** (still 2.6x):
+```
+56.7%  libnvidia-eglcore   (driver)
+15.1%  [unknown]           (kernel)
+13.6%  libSimpleFPEWrapper (wrapper - no hotspot >2.1%)
+ 5.8%  libc                (ring memcpy)
+```
+Each 4-vertex batch still issues ~4 driver calls: glUseProgram, glBindVertexArray,
+glBindBuffer, glDrawArrays. gl4es needs only the draw. The deferred restore
+removed 3 more (restore program/vao/buffer) from every draw, taking this from
+3.04 to 0.89 µs, but the setup calls on the first draw of each batch remain.
+
+**drawelements** (2.1x):
+```
+51%  kernel         (GPU DMA submission)
+19%  libnvidia       (driver)
+16%  libc            (memmove: __memmove_avx_unaligned_erms)
+ 2%  wrapper
+```
+The 16% libc is the ring-buffer upload of client vertex + index data. gl4es
+passes client pointers directly to glDrawElements on the default VAO, so no
+upload happens at all. This wrapper cannot use client pointers on VAO 0 because
+that would overwrite the app's own attribute state there; it must use fpe_vao
+with a VBO. The upload is inherent and cannot be removed without abandoning VAO
+isolation.
+
+**Conclusion:** six of nine comparison phases now beat gl4es, and the three
+remaining gaps have verifiably structural causes independent of wrapper CPU work.
+The primary source of all three is that this wrapper must coexist with the app's
+own GL state, which forces save-restore and VBO isolation; gl4es owns all GL
+state and has neither constraint. The gap has narrowed from 10x / 5.7x / 3.6x
+to 2.6x / 1.5x / 2.1x.
+
+
 
 Re-profiled after the merge (`perf record --call-graph dwarf`, tinybatch only),
 by shared object:
