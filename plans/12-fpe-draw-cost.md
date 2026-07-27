@@ -4,17 +4,26 @@ Same-machine comparison against gl4es 1.1.7, NVIDIA GTX 1660 SUPER, both
 libraries on the same GLES backend, viewport 1x1 so fragment work is out of
 the measurement, best of 3 (harness: `tests/bench_cmp_gl4es.c`).
 
-| phase | SFPEW | gl4es | ratio |
-|---|---|---|---|
-| tinybatch (1 quad per Begin/End) | 3.51 us/batch | 0.35 us/batch | 10.0x slower |
-| dlist replay | 8.7 ns/vert | 9.1 ns/vert | 1.05x FASTER (was 9.6x slower) |
-| clientarrays | 34.2 ns/vert | 6.0 ns/vert | 5.7x slower |
-| drawelements | 14.0 ns/idx | 3.9 ns/idx | 3.6x slower |
-| texswitch | 4.04 us/draw | 2.28 us/draw | 1.8x slower |
-| progtoggle | 4.36 us/draw | 5.18 us/draw | 1.2x FASTER |
-| immediate | 85.9 ns/vert | 117.3 ns/vert | 1.4x FASTER |
-| matrixops | 96.4 ns/group | 182.8 ns/group | 1.9x FASTER |
-| getter | 10.6 ns/call | 89.3 ns/call | 8.4x FASTER |
+SFPEW column re-measured after the `perf` merge (below); the gl4es column is
+from the first run of the same harness on the same machine - gl4es is unchanged
+code, so only the ratios were recomputed.
+
+| phase | SFPEW before | SFPEW now | gl4es | ratio now |
+|---|---|---|---|---|
+| tinybatch (1 quad per Begin/End) | 3.51 us | 3.04 us/batch | 0.35 us | 8.7x slower |
+| dlist replay | 8.7 | 7.3 ns/vert | 9.1 | 1.25x FASTER |
+| clientarrays | 34.2 | 7.2 ns/vert | 6.0 | 1.2x slower |
+| drawelements | 14.0 | 8.5 ns/idx | 3.9 | 2.2x slower |
+| texswitch | 4.04 | 3.43 us/draw | 2.28 | 1.5x slower |
+| progtoggle | 4.36 | 3.70 us/draw | 5.18 | 1.4x FASTER |
+| immediate | 85.9 | 52.5 ns/vert | 117.3 | 2.2x FASTER |
+| matrixops | 96.4 | 101.9 ns/group | 182.8 | 1.8x FASTER |
+| getter | 10.6 | 11.8 ns/call | 89.3 | 7.6x FASTER |
+
+The merge closed **clientarrays** (5.7x slower -> 1.2x, essentially parity) and
+halved the **drawelements** gap. Six of nine phases now beat gl4es.
+**tinybatch is the one remaining real gap**, and it is the per-Begin/End fixed
+cost, not throughput.
 
 The split is clean: pure CPU state work is ahead, and every phase that is
 behind shares the one draw-submission path. So the gap is a fixed per-draw
@@ -42,15 +51,15 @@ number.
 5. **Vertex attribute setup per draw.** Already cached: `send_vertex_attributes`
    returns early on `!va.dirty`, and each attribute's format/binding is
    compared against `fpe_vertex_attributes` before being re-sent.
-6. **Deferred state restore, flushed from `sfpewEnsureBackend`.** Implemented
-   and reverted: no measurable gain (tinybatch 3.51 -> 3.34 us, within
-   noise). The reason is structural - the fixed-function entry points call
-   `sfpewEnsureBackend` too, so `glVertex3f`/`glEnd` flush the deferred state
-   between draws and it is restored and re-bound exactly as before. A working
-   version has to place the flush only on the non-fixed-function entry points
-   (passthrough, getters, user-program draws), which is the exhaustive
-   enumeration that makes this option risky: a missed observer is silent
-   state corruption, not a test failure.
+6. **Deferred state restore flushed from `sfpewEnsureBackend`.** That
+   *placement* is ruled out, not the idea. It measured as no gain (tinybatch
+   3.51 -> 3.34 us, noise) for a structural reason: the fixed-function entry
+   points call `sfpewEnsureBackend` too, so `glVertex3f`/`glEnd` flushed the
+   deferred state between draws and it was re-bound exactly as before. The
+   same is true of `flushPendingImmediateDraws()` (109 call sites, the
+   codebase's existing "something else is happening" barrier) - `glBegin`
+   calls it, so hooking there self-defeats identically. See "The prize" below
+   for what the idea is actually worth with a correct flush placement.
 
 7. **The ring's rotating offset.** Pinning the immediate-mode upload offset to
    zero (an unsafe measurement, reverted) made tinybatch 4x WORSE, 3.9 ->
@@ -60,12 +69,34 @@ number.
 
 ## Where the time actually goes
 
-`perf` with call graphs puts 54% of tinybatch inside `glEnd` ->
-`drawImmediateVertices`, of which the largest single leaf is an NVIDIA
-driver function (~16%) reached from the draw, plus ~8% in `__ioctl` and
-~12% in the kernel. That is driver-side command submission, not wrapper
-CPU time - consistent with the wrapper issuing more GL calls per draw than
-gl4es does, rather than doing more work per call.
+Re-profiled after the merge (`perf record --call-graph dwarf`, tinybatch only),
+by shared object:
+
+| | share of tinybatch |
+|---|---|
+| `libnvidia-eglcore` | 56.7% |
+| kernel | 15.1% |
+| `libSimpleFPEWrapper` | 13.6% |
+| `libc` (mostly the ring `memmove`) | 5.8% |
+| `ld-linux` (TLS descriptor resolution) | 4.8% |
+
+~72% is driver-side command submission. The wrapper's own 13.6% is fragmented
+with no hotspot above 2.1% (`send_vertex_attributes` 2.1%, `advance()` 1.7%,
+`drawImmediateVertices` 1.6%, `program_hash` 1.6%), so there is nothing left to
+win by micro-optimizing wrapper code. The lever is the *number* of driver calls
+per draw, which is what the deferred restore above attacks.
+
+One dead end found here and reverted: the 4.8% in `ld-linux` is real
+(`_dl_tlsdesc_dynamic_xsave` 2.65% + `__tls_get_addr` 0.94%), caused by a small
+draw touching ~6 separate `thread_local` blocks under the default
+general-dynamic TLS model. Marking the hot ones
+`__attribute__((tls_model("initial-exec")))` does remove it, but glibc must
+then fit the module's *entire* TLS block in the static-TLS surplus, and this
+library's is 9152 bytes (6144 of it one 256-entry display-list cache) against a
+~1664-byte default surplus - so `smoke_dlopen` fails outright with "cannot
+allocate memory in static TLS block", and dlopen is how the library is normally
+loaded. Not worth shrinking three caches to chase 3.6% while tinybatch is
+still 8.7x off.
 
 ## The architectural difference
 
@@ -108,6 +139,45 @@ Candidate directions:
   colorless list must draw in the color current at `glCallList` time). It also
   merges adjacent runs into one draw. dlist 87.5 -> 8.7 ns/vert, overtaking
   gl4es (9.1). Covered by `smoke_list_immediate` + `smoke_list_current_attr`.
+
+## The prize: what deferred restore is actually worth
+
+Measured directly by disabling the work rather than by guessing. Two unsafe
+build hacks (both reverted; they existed only to bound the win):
+
+| tinybatch, NVIDIA, viewport 1x1 | us/batch |
+|---|---|
+| as shipped | 3.29 - 3.46 |
+| guard destructor made a no-op (restores skipped) | 2.55 - 2.72 |
+| ...and the setup re-binds skipped when already ours | 1.01 - 1.11 |
+
+So deferred restore is worth **~3.3x on tinybatch** (3.4 -> 1.03 us), which
+would move it from 9.7x slower than gl4es to ~2.9x. Roughly 7 driver calls per
+batch disappear at ~340ns each on this driver, which is consistent with the
+56.7% of the profile that sits in `libnvidia-eglcore`.
+
+Both halves are needed and they are the same mechanism: skipping the restore is
+only 22% on its own, because the next draw re-binds anyway. Keeping the
+fixed-function program/VAO/buffer bound *across* consecutive draws is what
+removes both.
+
+What makes it safe is the flush placement, and the observer set is smaller than
+it first looks: `glGetIntegerv(GL_CURRENT_PROGRAM)` and
+`GL_ARRAY_BUFFER_BINDING` are already answered from the logical shadows, which
+track the app's view and which the FPE draw path deliberately never touches -
+those getters stay correct for free. What genuinely observes is the
+VBO/VAO/shader API surface (draws through the passthrough path,
+`glVertexAttribPointer`, `glBufferData`/`SubData`/`Map`, the three bind
+entries, backend-passthrough queries of `GL_VERTEX_ARRAY_BINDING` /
+`GL_ELEMENT_ARRAY_BUFFER_BINDING`) plus frame/context boundaries, plus
+deletion of a name held in the pending save (which must invalidate, not
+flush - restoring a deleted name resurrects it).
+
+Before implementing, add the property that the previous attempt lacked: a debug
+mode that asserts, on entry to every wrapper function, that the backend's real
+bindings match what the deferred bookkeeping believes. That turns a missed
+observer from silent state corruption into a failing test, and the 670-test
+suite plus the piglit subset then actually police the enumeration.
 
 ## Merged with the `perf` branch's sprint
 
