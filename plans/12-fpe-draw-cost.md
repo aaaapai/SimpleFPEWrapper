@@ -10,7 +10,7 @@ code, so only the ratios were recomputed.
 
 | phase | SFPEW before | SFPEW now | gl4es | ratio now |
 |---|---|---|---|---|
-| tinybatch (1 quad per Begin/End) | 3.51 us | 3.04 us/batch | 0.35 us | 8.7x slower |
+| tinybatch (1 quad per Begin/End) | 3.51 us | 0.89 us/batch | 0.35 us | 2.6x slower |
 | dlist replay | 8.7 | 7.3 ns/vert | 9.1 | 1.25x FASTER |
 | clientarrays | 34.2 | 7.2 ns/vert | 6.0 | 1.2x slower |
 | drawelements | 14.0 | 8.5 ns/idx | 3.9 | 2.2x slower |
@@ -21,9 +21,15 @@ code, so only the ratios were recomputed.
 | getter | 10.6 | 11.8 ns/call | 89.3 | 7.6x FASTER |
 
 The merge closed **clientarrays** (5.7x slower -> 1.2x, essentially parity) and
-halved the **drawelements** gap. Six of nine phases now beat gl4es.
-**tinybatch is the one remaining real gap**, and it is the per-Begin/End fixed
-cost, not throughput.
+halved the **drawelements** gap; deferring the draw-state restore then took
+**tinybatch** from 8.7x to 2.6x. Six of nine phases beat gl4es and the worst
+remaining gap is 2.6x, down from 10x when this file was started.
+
+What is left is small and structural. The wrapper cannot reach gl4es on
+tinybatch because gl4es owns all GL state while this wrapper has to coexist
+with the host's own GL/GLES calls, so a fixed-function draw still has to leave
+the app's bindings as it found them - now once per run of draws rather than once
+per draw, but never zero.
 
 The split is clean: pure CPU state work is ahead, and every phase that is
 behind shares the one draw-submission path. So the gap is a fixed per-draw
@@ -173,7 +179,53 @@ entries, backend-passthrough queries of `GL_VERTEX_ARRAY_BINDING` /
 deletion of a name held in the pending save (which must invalidate, not
 flush - restoring a deleted name resurrects it).
 
-### Blocked on a prerequisite: the buffer surface is not intercepted
+### LANDED
+
+tinybatch **3.04 -> 0.89 us/batch**, slightly better than the 1.03 us bound
+predicted above, taking it from 8.7x slower than gl4es to 2.6x. No other phase
+moved. Two halves, both needed:
+
+1. `fpe_backend_draw_state_guard_t` no longer restores in its destructor. The
+   save moves to `glstate_t::deferred_draw` and is replayed by
+   `sfpewEntryBarrier()`, which every exported entry point outside the
+   immediate-mode vertex family calls first. The default is inverted to safe:
+   a barrier that is not needed costs the restore it would have paid anyway,
+   so only glBegin/glEnd and the glVertex/glColor/glNormal/glTexCoord/... calls
+   keep the bare `flushPendingImmediateDraws()`.
+2. `glstate_t::immediate_live_program` lets `drawImmediateVertices` skip its
+   `glUseProgram` + `glBindVertexArray` + `glBindBuffer` when the previous
+   immediate draw already left that trio bound. Skipping the restore alone was
+   only 22%; the re-binds are the other half.
+
+The flag is deliberately narrow, because the two failure modes are not
+symmetric: failing to SET it just costs speed, while failing to CLEAR it skips
+a bind that was needed. So the clear lives inside
+`sfpewBackendBindVertexArray()` (which every FPE path and the app's own
+`glBindVertexArray` already route through) plus
+`sfpewInvalidateImmediateDrawState()` at the handful of places that bind a
+program without touching a VAO - `SET_PREV_PROGRAM`, pixelops, the shader
+object helpers, `glUseProgram`, `commit_fpe_state_on_draw`. Three raw
+`glBindVertexArray(fpe_user_vao)` calls were converted to the helper for the
+same reason.
+
+**The bug this shook out**, and the one worth remembering: the logical program
+shadow self-heals every 256 queries by asking the backend for
+`GL_CURRENT_PROGRAM`. With the restore deferred, that query sees the WRAPPER's
+program and poisons the shadow with an internal id - after which every
+fixed-function draw took the user-program path and passed `GL_QUADS` straight
+to GLES, so `clientarrays` and `gatherarrays` dropped every draw and raised
+`GL_INVALID_ENUM`. The same applies to the array-buffer and VAO shadows. A
+reconcile against the backend is only meaningful while the backend actually
+holds the app's state, so all three now answer from `deferred_draw` while it is
+held. Any future shadow that heals off a backend query needs the same
+treatment.
+
+Policing: `smoke_vbo_surface` (phase C2), `smoke_render`, `smoke_mixed_pipeline`
+and `bench.fpe` all fail if the barrier is disabled - verified by temporarily
+stubbing it out. `bench_fpe.c` now reports GL errors per phase instead of one
+"something failed" at the end, which is what localized the shadow bug.
+
+### The prerequisite this needed: intercepting the buffer surface
 
 Attempted and reverted, for a reason no flush placement can fix. An observer
 only gets a flush if the wrapper *sees* the call, and several entry points that
@@ -186,9 +238,9 @@ pointer and the wrapper never observes them at all:
 `glDisableVertexAttribArray`, `glMapBufferRange`, `glUnmapBuffer`,
 `glGetBufferParameteriv`.
 
-Today that is harmless: the guard restores before every entry point returns, so
-between wrapper calls the app's bindings are always correct. Under deferred
-restore it is silent corruption - a fixed-function draw leaves the wrapper's
+Wrapped in d125f79. Before that it was harmless, because the guard restored
+before every entry point returned, so between wrapper calls the app's bindings
+were always correct. Under deferred restore it would have been silent corruption - a fixed-function draw leaves the wrapper's
 ring buffer and VAO bound, then the app's own `glBufferData(GL_ARRAY_BUFFER, …)`
 writes into the wrapper's ring, and its `glVertexAttribPointer` configures the
 wrapper's VAO instead of its own. That is exactly the LWJGL/VBO frontend
@@ -198,20 +250,10 @@ Note this is already a latent inconsistency independent of deferred restore:
 the wrapper shadows the `GL_ARRAY_BUFFER` binding (`glBindBuffer` is wrapped)
 but cannot see writes through that binding.
 
-So the work splits, and the first half stands on its own:
-
-1. **Wrap the remaining buffer/attribute surface** so nothing that touches
-   those bindings bypasses the wrapper - the list above, passed through plus
-   shadow maintenance. Bounded, mechanical, no behaviour change intended.
-2. **Then deferred restore**, plus the property the earlier attempt lacked: a
-   debug mode (`SFPEW_DRAW_STATE_CHECK=1`) asserting on entry to every wrapper
-   function that the backend's real bindings match what the deferred
-   bookkeeping believes, so a missed observer becomes a failing test instead of
-   silent corruption, and the 670-test suite and piglit subset police the
-   enumeration.
-
-Until (1) lands, tinybatch's 8.7x stands. Six of nine phases already beat
-gl4es, so this is the last phase behind, not a general deficit.
+Also worth noting independently of the perf work: the ARB spellings were routed
+to the backend by `GETPROC_BACKEND_ALIAS` even for entry points the wrapper does
+implement, and LWJGL2 asks for those by preference. `GETPROC_WRAPPER_ALIAS` now
+distinguishes the two cases.
 
 ## Merged with the `perf` branch's sprint
 
