@@ -173,11 +173,45 @@ entries, backend-passthrough queries of `GL_VERTEX_ARRAY_BINDING` /
 deletion of a name held in the pending save (which must invalidate, not
 flush - restoring a deleted name resurrects it).
 
-Before implementing, add the property that the previous attempt lacked: a debug
-mode that asserts, on entry to every wrapper function, that the backend's real
-bindings match what the deferred bookkeeping believes. That turns a missed
-observer from silent state corruption into a failing test, and the 670-test
-suite plus the piglit subset then actually police the enumeration.
+### Blocked on a prerequisite: the buffer surface is not intercepted
+
+Attempted and reverted, for a reason no flush placement can fix. An observer
+only gets a flush if the wrapper *sees* the call, and several entry points that
+read or write `GL_ARRAY_BUFFER` / the bound VAO are neither wrapped nor handed
+out by `eglGetProcAddress`, so they fall through to the backend's own function
+pointer and the wrapper never observes them at all:
+
+`glBufferData`, `glBufferSubData`, `glVertexAttribPointer`,
+`glVertexAttribIPointer`, `glEnableVertexAttribArray`,
+`glDisableVertexAttribArray`, `glMapBufferRange`, `glUnmapBuffer`,
+`glGetBufferParameteriv`.
+
+Today that is harmless: the guard restores before every entry point returns, so
+between wrapper calls the app's bindings are always correct. Under deferred
+restore it is silent corruption - a fixed-function draw leaves the wrapper's
+ring buffer and VAO bound, then the app's own `glBufferData(GL_ARRAY_BUFFER, …)`
+writes into the wrapper's ring, and its `glVertexAttribPointer` configures the
+wrapper's VAO instead of its own. That is exactly the LWJGL/VBO frontend
+014436b added support for, so it is not a hypothetical.
+
+Note this is already a latent inconsistency independent of deferred restore:
+the wrapper shadows the `GL_ARRAY_BUFFER` binding (`glBindBuffer` is wrapped)
+but cannot see writes through that binding.
+
+So the work splits, and the first half stands on its own:
+
+1. **Wrap the remaining buffer/attribute surface** so nothing that touches
+   those bindings bypasses the wrapper - the list above, passed through plus
+   shadow maintenance. Bounded, mechanical, no behaviour change intended.
+2. **Then deferred restore**, plus the property the earlier attempt lacked: a
+   debug mode (`SFPEW_DRAW_STATE_CHECK=1`) asserting on entry to every wrapper
+   function that the backend's real bindings match what the deferred
+   bookkeeping believes, so a missed observer becomes a failing test instead of
+   silent corruption, and the 670-test suite and piglit subset police the
+   enumeration.
+
+Until (1) lands, tinybatch's 8.7x stands. Six of nine phases already beat
+gl4es, so this is the last phase behind, not a general deficit.
 
 ## Merged with the `perf` branch's sprint
 
