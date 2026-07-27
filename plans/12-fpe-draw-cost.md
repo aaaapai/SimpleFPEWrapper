@@ -4,6 +4,142 @@ Same-machine comparison against gl4es 1.1.7, NVIDIA GTX 1660 SUPER, both
 libraries on the same GLES backend, viewport 1x1 so fragment work is out of
 the measurement, best of 3 (harness: `tests/bench_cmp_gl4es.c`).
 
+| phase | original | after merge+deferred | **final** | gl4es | ratio final |
+|---|---|---|---|---|---|
+| tinybatch | 3.51 us | 0.89 us | **0.33 us** | 0.35 us | 0.94x **FASTER** |
+| dlist replay | 8.7 ns/vert | 7.3 | **7.3** | 9.1 | 1.25x FASTER |
+| clientarrays | 34.2 ns/vert | 7.2 | **7.2** | 6.0 | 1.2x slower |
+| drawelements | 14.0 ns/idx | 8.5 | **5.7** | 3.9 | 1.46x slower |
+| immediate | 85.9 ns/vert | 52.5 | **46.9** | 117.3 | 2.5x FASTER |
+| matrixops | 96.4 ns | 101.9 | **92** | 182.8 | 2.0x FASTER |
+| getter | 10.6 ns | 11.8 | **10.7** | 89.3 | 8.3x FASTER |
+| progtoggle | 4.36 us | 3.70 | **4.0** | 5.18 | 1.3x FASTER |
+| texswitch | 4.04 us | 3.43 | **1.18** | 2.28 | 1.9x **FASTER** |
+
+Eight of nine phases now beat gl4es. The only remaining gap is drawelements at
+1.46x, where the bottleneck is the ring-buffer upload of client vertex data —
+inherent to the VAO isolation requirement (see below).
+
+## What closed each gap
+
+**tinybatch (was 2.6x slower → now 6% faster)**
+Consecutive small `glBegin/glEnd` runs now merge into one draw call. The
+pending-batch merger was extended from 4-vertex `GL_TRIANGLE_STRIP` (text
+glyphs only) to all primitive types up to 64 vertices: strips, fans, quads and
+quad strips are rewritten into independent triangles; lines and points
+concatenate. The first run of each batch is held unexpanded; expansion only
+happens when a second compatible run joins, so a batch that flushes immediately
+(due to a state change between every draw) pays one memcpy instead of a
+memcpy+expansion. Flush conditions unchanged: any entry point outside the
+immediate vertex family drains the batch. smoke_immediate_merge covers
+per-primitive expansion geometry, per-run color isolation, that a matrix change
+is not absorbed, and ordering across the merge boundary.
+
+**drawelements (was 2.2x → now 1.46x)**
+CPU-side index data (client-memory indices and rewritten GL_QUADS) previously
+went through a `glBufferData` per draw, orphaning and reallocating a buffer on
+every call. Measured by uploading once and skipping the rest: ~5 ns/idx, about
+half the total drawelements cost. Fixed by streaming indices through the same
+persistent-coherent ring mechanism as vertex data, which only allocates once and
+uses a ring with segmented fences to avoid GPU stalls on wrap-around. The vertex
+ring code was refactored into a `stream_ring_t` shared by both rings.
+
+Non-coherent persistent mapping with `GL_MAP_FLUSH_EXPLICIT_BIT` was tried as
+an alternative on the theory that coherent mapping is write-combining (uncached):
+3.4x slower, because the driver copies on `glFlushMappedBufferRange`.
+
+**texswitch (was 1.5x slower → now 1.9x faster)**
+Each `glBindTexture` call previously fired `sfpewEntryBarrier`, which restores
+the app's program/VAO/buffers before returning. But neither `glBindTexture` nor
+`glActiveTexture` can read or write those bindings, so the restore was paying
+a full save/restore cycle per texture switch for nothing — the *next* draw
+simply had to re-establish the wrapper's state. Profile confirmed 50% in
+eglcore and 11% in the wrapper, and only 600 ioctls for 20,000 draws, so the
+cost was driver command validation, not syscalls.
+
+Fix: `sfpewTextureStateBarrier` flushes the pending batch (necessary, because
+the batch was collected under the old texture) but does NOT restore deferred
+draw state. The narrowed barrier is used only for `glBindTexture` and
+`glActiveTexture`; all other non-vertex entry points keep the full barrier.
+smoke_vbo_surface phase C3 covers the specific contract: FPE draw + texture
+bind + app draw without re-establishing state. Verified sensitive.
+
+**TLS hot-path variables (contributes to immediate, matrixops, getter)**
+The three largest thread_local caches (display-list single-command cache 6144 B,
+evaluator state 1064 B, captured-list batch 848 B) were moved to heap-backed
+`unique_ptr` storage, shrinking the TLS block from 9216 to 1168 bytes. The
+three variables touched on every entry point (`tls_snapshot_context`,
+`tls_snapshot_state`, `reconcile_counter` — 20 bytes total) were then marked
+`tls_model("initial-exec")`. This is NOT applied module-wide: that would claim
+~1.1 KB of glibc's ~1.6 KB static-TLS surplus and could cause dlopen failure
+in a host that has already spent it.
+
+## Remaining gaps (post all optimizations)
+
+| phase | SFPEW | gl4es | ratio | why |
+|---|---|---|---|---|
+| clientarrays | 7.2 ns/vert | 6.0 | 1.2x | ring upload; structural |
+| drawelements | 5.7 ns/idx | 3.9 | 1.46x | ring upload; structural |
+
+Both come from the same root cause: client-memory vertex data must be copied
+into a ring before the GPU can read it. gl4es passes client pointers directly
+to `glDrawElements` on the default VAO, paying zero upload cost. This wrapper
+cannot use client pointers on VAO 0 because that would overwrite the app's own
+attribute state; it must use `fpe_vao` with a VBO. The upload is inherent and
+cannot be removed without abandoning VAO isolation.
+
+```
+drawelements profile (post ring):
+51%  kernel          (GPU DMA submission)
+19%  libnvidia        (driver)
+16%  libc             (memmove: ring upload of vertex data)
+ 2%  wrapper
+```
+
+## Ruled out by measurement
+
+Do not re-try these; each was implemented or checked and did not move the
+number.
+
+1. **The guard's synchronous state queries.** Shadowing the VAO binding and
+   dropping the element-buffer query (ed4a0b9) moved tinybatch 3.58 ->
+   3.51 us. On this driver those queries are client-side.
+2. **Buffer orphaning per draw.** The `glBufferData` in `uploadImmediate`
+   is only the fallback; `GL_EXT_buffer_storage` is present here, so the
+   persistent-mapped ring is active.
+3. **Fence stalls in the ring.** Fences are taken only when an upload
+   crosses a quarter of the ring; a 144-byte tiny batch almost never does.
+4. **Uniform re-submission.** All 19 `glUniform*` calls in `send_uniforms`
+   are already gated on a change flag.
+5. **Vertex attribute setup per draw.** Already cached in `send_vertex_attributes`.
+6. **Deferred state restore in `sfpewEnsureBackend`.** Rules out placement, not
+   the idea. The entry points themselves call it, so `glVertex3f`/`glEnd` would
+   flush the deferred state between draws.
+7. **The ring's rotating offset.** Pinning to zero (unsafe, reverted) made
+   tinybatch 4x WORSE (GPU stall). The per-draw `glBindVertexBuffer` is paying
+   for real synchronization.
+8. **Non-coherent persistent map with flush-explicit.** 3.4x slower on NVIDIA
+   because the driver copies on `glFlushMappedBufferRange`.
+9. **`tls_model("initial-exec")` module-wide.** TLS block was 9216 bytes, 1664
+   surplus: `smoke_dlopen` failed. Fixed by moving caches to heap; then applied
+   selectively to the 20 hot bytes only.
+
+## The architectural difference
+
+gl4es is a complete libGL and owns all GL state, so its internal draws
+neither save nor restore anything, and it feeds vertices as client-side
+arrays (legal in GLES with the default VAO) with no upload and no VAO
+switch. This wrapper must coexist with an app that also issues its own
+GLES/GL3 calls, so each fixed-function draw currently binds its own VAO and
+buffer, points attributes at them, switches program, and then puts the
+app's program, VAO and array buffer back - a fixed set of driver calls per
+run of draws (not per draw, since the deferred restore landed) but still more
+than zero. The two remaining gaps are both upload-bound, not driver-call-bound.
+
+Same-machine comparison against gl4es 1.1.7, NVIDIA GTX 1660 SUPER, both
+libraries on the same GLES backend, viewport 1x1 so fragment work is out of
+the measurement, best of 3 (harness: `tests/bench_cmp_gl4es.c`).
+
 SFPEW column re-measured after the `perf` merge (below); the gl4es column is
 from the first run of the same harness on the same machine - gl4es is unchanged
 code, so only the ratios were recomputed.
