@@ -485,3 +485,76 @@ attribute formats) this path does. The 1x1 viewport removes fragment cost
 but not these differences, so treat the absolute ratios as approximate. The
 "gap is per-draw fixed cost" conclusion comes from the profile and from the
 phase split above, and does not depend on them.
+
+## Addendum: the user-program FPE path (2026-07 RDC-driven pass)
+
+Everything above measures fixed-function draws with program 0. Minecraft with
+shaders does not do that: it binds its own program and the wrapper feeds the
+legacy arrays and the fixed-function uniform block into it
+(`sfpewSendUserProgramAttributes`, `sfpewFeedUserProgramUniforms`). No
+benchmark phase exercised that path, so its per-draw cost was invisible here
+until `bench.userprog` / `bench.userprogelements` were added.
+
+Evidence came from RenderDoc captures of the real thing rather than from the
+harness. Both are Adreno 750 / GLES / Android:
+
+| capture | draws | frame calls | calls/draw |
+|---|---|---|---|
+| `1.16-Optifine/1-frame19661.rdc` | 115 | 3692 | 22 |
+| `1.16-Sodium/1-frame5312.rdc` | 611 | 4363 | 7.1 |
+
+Sodium is already lean - it issues no `glVertexAttribPointer` at all, using
+`glVertexAttribFormat` + `glBindVertexBuffer` once per VAO - which left the
+wrapper's own per-draw traffic as the dominant remaining cost in that frame.
+
+What the captures showed, and what was fixed:
+
+| finding | measured | fix |
+|---|---|---|
+| `glEnableVertexAttribArray` re-issued on the wrapper's own VAO | 365 / 373 redundant (9.9% of the OptiFine frame) | consult the `fpe_user_vao_enabled` mask that already existed for disables |
+| attribute-buffer bind when the app already had it bound | 107 / 549 `glBindBuffer` | `sfpewBackendBindAttributeBuffer()`, using the guard's own save |
+| largest-index scan with no consumer | 108630 indices/frame walked for nothing | compute on demand; a VBO-backed array makes the gather bail regardless |
+| fixed-function uniforms re-sent unchanged | 1204 / 4363 calls in the Sodium frame (27.6%) | per-program, per-slot last-value cache |
+
+After these, the wrapper contributes zero per-draw calls to Sodium's dominant
+draw shape; the residue in that capture is Sodium's own traffic (its
+`ELEMENT_ARRAY` unbind-then-bind pair, its per-chunk VAO switches, and
+`glVertexAttrib4fv` carrying real per-chunk model offsets - 140 distinct
+payloads over 273 calls, correctly left alone).
+
+Benchmarked five runs each against `2c306fd`, same machine, same binary:
+
+| phase | before | after | change |
+|---|---|---|---|
+| `userprogelements` | 1020-1080 Midx/s | 1285-1386 Midx/s | **+30%** |
+| `userprog` | 1339-1436 Mvert/s | 1251-1548 Mvert/s | parity (too noisy to call) |
+
+**The table at the top of this document is stale.** Its `clientarrays` 7.2
+ns/vert and `drawelements` 5.7 ns/idx predate `2c306fd`, which already
+measures 6.8-7.0 and 5.2-5.4 on this machine. Comparing fresh numbers against
+that table instead of against a rebuilt baseline credits changes with gains
+they did not produce. The fixed-function phases are unchanged by this pass, as
+expected - they never bind a user program.
+
+Also note `bench.userprog` deliberately sources attributes from a VBO. With
+client pointers it uploads 144KB per draw, runs 26x slower (18 vs 0.7
+ns/vert), and is memory-bound with a run-to-run spread that hides any
+call-count change entirely.
+
+### Still open
+
+- **The draw guard's dead restore.** The guard restores the app's bindings at
+  the next entry point, and the app frequently overwrites them immediately:
+  101 dead `ARRAY_BUFFER` binds in the OptiFine frame. Collapsing these needs
+  a lazy restore that materializes only when something would observe it -
+  an architectural change, not a local one.
+- **The logical array-buffer shadow never heals.** The program and VAO shadows
+  re-query every 256 draws; `getLogicalArrayBufferBinding()` answers from its
+  shadow forever once seeded, re-seeding only on a context change. An app that
+  binds `GL_ARRAY_BUFFER` outside the wrapper (JNI direct dispatch, a layered
+  wrapper) desynchronizes it permanently. This predates the pass above - the
+  attribute buffer was already computed from the same shadow - but it is the
+  one shadow with no self-healing.
+- `glTexParameteri` repeats a current value 111 of 145 times in the OptiFine
+  frame, but almost all of those are in the initialization block rather than
+  the steady state, so the per-frame value is low.
