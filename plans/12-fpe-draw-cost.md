@@ -590,6 +590,47 @@ every armour layer is a set of small compiled lists, a few hundred replays a
 frame. Not diagnosed further here; the likely candidates are the per-replay
 state commit and the batch flush each intervening matrix call forces.
 
+### Negative result: uniform-driven alpha test
+
+Collapsing the alpha-test-on and alpha-test-off program variants into one
+shader, selected by an `fpe_AlphaTestFunc` uniform, was tried and rejected.
+
+It works as designed: `bench.progcompile` improves 35% (0.17 -> 0.11
+ms/program) and the 16 enable-combos generate 8 programs instead of 16,
+confirmed by counting generations rather than inferring from timing. But the
+fragment shader then always carries a `discard` the compiler cannot remove, and
+all seven draw phases regressed together - progcache toggling -5.9%, mcentity
+-6.5%, mcchunkmulti -3.8%, mcgui -3.7%, tinybatch -3.6%, mcfont -2.4%,
+immediate -1.6%. Seven of seven in one direction is not noise (~0.8% by
+chance). Paying 2-6% on every draw to save one-off compile time is the wrong
+trade for a game that compiles once and draws millions of times.
+
+Worth keeping in mind before the idea is retried for fog or lighting: the same
+shape of tradeoff applies, and the compile-side win has to be weighed against a
+permanent per-draw cost.
+
+### Correction: what bench.mcgui actually measures
+
+The phase looked like it toggled alpha test per widget, and that assumption
+drove the attempt above. It does not. It disables the test *before* the draw
+and re-enables it *after*, so no draw ever observes it enabled - instrumenting
+the hash showed `alpha_test_enable = 0` on every call, and the program never
+switched on it. The ~4 us/widget is texture binding plus the enable/disable and
+blend traffic itself, not program switching.
+
+The same instrumentation is the way to check any similar claim: count program
+generations directly instead of reading it out of a timing delta.
+
+### Correction: the canonicalization had a cache bug
+
+The first canonicalization pass changed the hash inputs and the cache store but
+not the cache comparison, which kept testing raw `fpe_state` values. The two
+disagreed whenever a feature was disabled while its parameter was non-zero -
+which includes a default context, since GL's default `alpha_func` is
+`GL_ALWAYS` with alpha test off. The fast-path cache then missed on every draw
+and fell into a full two-pass xxhash. Fixed by computing the canonical values
+once into locals used by all three of comparison, hash and store.
+
 ### Still open
 
 - **The draw guard's dead restore.** The guard restores the app's bindings at
@@ -607,3 +648,9 @@ state commit and the batch flush each intervening matrix call forces.
 - `glTexParameteri` repeats a current value 111 of 145 times in the OptiFine
   frame, but almost all of those are in the initialization block rather than
   the steady state, so the per-frame value is low.
+- **Small display-list replay (~3 us).** Profiled: the lists are already
+  compiled into the static VBO arena, so this is not re-upload. 43% of the
+  phase sits in the NVIDIA driver, and the wrapper-side work that remains is
+  largely unavoidable - the modelview matrix genuinely changes between boxes,
+  so the uniform upload is real. Reducing it needs the per-replay state commit
+  restructured, not a local fix.
