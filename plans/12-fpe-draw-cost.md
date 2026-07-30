@@ -541,6 +541,55 @@ client pointers it uploads 144KB per draw, runs 26x slower (18 vs 0.7
 ns/vert), and is memory-bound with a run-to-run spread that hides any
 call-count change entirely.
 
+### Minecraft-shaped columns
+
+The phases above each isolate one mechanism, which attributes a change but does
+not say whether a frame got faster - a change that trades immediate-mode cost
+against matrix cost can leave all of them flat. Five composites reproduce the
+GL 1.x sequence the game issues, reconstructed from the captures above plus the
+known vanilla vertex formats (representative, not captured verbatim):
+
+| phase | Minecraft site | reconstructed per-draw sequence |
+|---|---|---|
+| `mcchunk` | RenderGlobal, one large chunk | `glVertex/Color/TexCoordPointer` on a 28-byte VBO record (BLOCK format: 3f pos, 4ub colour, 2f uv, 2s lightmap), `glPushMatrix`/`glTranslatef`, `glDrawArrays(GL_QUADS)`, `glPopMatrix` |
+| `mcchunkmulti` | RenderGlobal, 16 chunks/frame | the same, plus `glClientActiveTexture(GL_TEXTURE1/0)` per chunk for the lightmap unit |
+| `mcgui` | Gui / GuiIngame | `glBindTexture`, `glEnable(GL_BLEND)`, `glBlendFunc`, `glDisable(GL_ALPHA_TEST)`, one `glBegin(GL_QUADS)` quad, then both toggles restored |
+| `mcfont` | FontRenderer | one `glBegin(GL_QUADS)` for the string, `glColor4f` + `glTexCoord2f` + `glVertex3f` per glyph |
+| `mcentity` | ModelRenderer | per box: `glPushMatrix`, `glTranslatef`, `glRotatef`, `glCallList`, `glPopMatrix` |
+
+The five draw with program 0, so they stand for **vanilla with no shader pack**,
+where the wrapper generates the whole pipeline. `userprog` /
+`userprogelements` are the **OptiFine/Sodium** case, where the app binds its own
+program. The two groups exercise disjoint code and normally move independently.
+
+Four runs each, this machine, against `2c306fd`:
+
+| phase | before | after | change |
+|---|---|---|---|
+| `mcchunk` | 0.8-1.0 ns/vert | 0.9 | parity |
+| `mcchunkmulti` | 2.83-3.70 us/chunk | 2.90-3.08 | parity |
+| `mcgui` | 3.91-5.09 us/widget | 4.11-4.93 | parity |
+| `mcfont` | 4.15-4.99 us/string | 4.03-4.28 | parity |
+| `mcentity` | 40.0-59.6 us/model | 41.5-57.7 | parity |
+
+Parity is the expected result: the four optimizations in this pass are all on
+the user-program path, which none of these five touch. They serve as a
+no-regression check on the vanilla path and a baseline for later work.
+
+### Open: small display-list replay costs ~3 us
+
+`bench.mcentity` reports ~42 us per 12-box model. Dropping the matrix calls
+from the loop moves it to 38 us, so the cost is `glCallList` itself rather than
+the surrounding matrix work: about 3 us per replay of a 6-quad list. For
+comparison, the same 288 vertices in a single list would be ~1.5 us at
+`bench.dlist`'s 5.3 ns/vert, and `bench.progcache` puts a plain steady draw at
+0.38 us - so small-list replay carries roughly eight times a draw's overhead.
+
+This matters because it is exactly how Minecraft draws entities: every mob and
+every armour layer is a set of small compiled lists, a few hundred replays a
+frame. Not diagnosed further here; the likely candidates are the per-replay
+state commit and the batch flush each intervening matrix call forces.
+
 ### Still open
 
 - **The draw guard's dead restore.** The guard restores the app's bindings at
