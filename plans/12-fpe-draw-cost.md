@@ -631,13 +631,43 @@ which includes a default context, since GL's default `alpha_func` is
 and fell into a full two-pass xxhash. Fixed by computing the canonical values
 once into locals used by all three of comparison, hash and store.
 
+### Negative result: eliding the guard's element-buffer restore
+
+The draw guard's `glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, held.element_array_buffer)`
+is 100% redundant where it runs at all: instrumenting the restore counted
+20000/20000 no-ops in `bench.mcgui` and 140000/140000 in `bench.mcentity`. The
+reason is structural - the wrapper binds its element buffer while its OWN VAO is
+current, and an element binding is VAO state, so VAO 0's binding is never
+disturbed. (The VAO restore, by contrast, is never redundant: 0%.)
+
+Eliding it against `backend_vao0_element_known/binding` was implemented and
+rejected. It measured slower on 6 of 12 phases and faster on none - mcentity
+-5.0%, mcchunkmulti -3.8%, tinybatch -3.5%, the rest flat. The driver already
+fast-paths a bind that does not change the binding, so a shadow read plus a
+branch in the restore path costs more than the call it removes.
+
+The general lesson for the remaining "redundant call" items in this document:
+a call being redundant in the capture does not mean removing it is a win. The
+driver may already dedupe it more cheaply than the wrapper can decide to skip
+it. Measure before assuming, and prefer removing work the wrapper does on the
+CPU (hashes, scans, uploads) over removing calls the driver will no-op anyway.
+
+`tests/smoke_element_binding_survives.c` was written during this attempt and is
+kept: nothing in the suite covered an app relying on its VAO-0 element binding
+surviving a fixed-function draw, and an unconditional elision passed all 680
+tests. It pins that contract for whatever touches the restore next.
+
 ### Still open
 
 - **The draw guard's dead restore.** The guard restores the app's bindings at
   the next entry point, and the app frequently overwrites them immediately:
-  101 dead `ARRAY_BUFFER` binds in the OptiFine frame. Collapsing these needs
-  a lazy restore that materializes only when something would observe it -
-  an architectural change, not a local one.
+  101 dead `ARRAY_BUFFER` binds in the OptiFine frame. Skipping the redundant
+  restore was tried for the element buffer and measured slower (see above), so
+  the remaining value here is not in eliding individual binds. A lazy restore
+  that materializes only when something would observe the binding could still
+  help by removing the restore *and* the app's subsequent rebind, but that is
+  an architectural change and the element-buffer result suggests the payoff
+  needs verifying on a real frame before the risk is worth taking.
 - **The logical array-buffer shadow never heals.** The program and VAO shadows
   re-query every 256 draws; `getLogicalArrayBufferBinding()` answers from its
   shadow forever once seeded, re-seeding only on a context change. An app that
