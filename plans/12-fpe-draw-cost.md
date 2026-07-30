@@ -668,13 +668,12 @@ tests. It pins that contract for whatever touches the restore next.
   help by removing the restore *and* the app's subsequent rebind, but that is
   an architectural change and the element-buffer result suggests the payoff
   needs verifying on a real frame before the risk is worth taking.
-- **The logical array-buffer shadow never heals.** The program and VAO shadows
-  re-query every 256 draws; `getLogicalArrayBufferBinding()` answers from its
-  shadow forever once seeded, re-seeding only on a context change. An app that
-  binds `GL_ARRAY_BUFFER` outside the wrapper (JNI direct dispatch, a layered
-  wrapper) desynchronizes it permanently. This predates the pass above - the
-  attribute buffer was already computed from the same shadow - but it is the
-  one shadow with no self-healing.
+- ~~**The logical array-buffer shadow never heals.**~~ Fixed: it now reconciles
+  every 256 queries like the program and VAO shadows, with the same
+  never-query-while-held exclusion. Note the test that ships with it does not
+  isolate the heal (it passes with the heal disabled); the change rests on
+  parity with the other two shadows and on the bind elision depending on this
+  one being right.
 - `glTexParameteri` repeats a current value 111 of 145 times in the OptiFine
   frame, but almost all of those are in the initialization block rather than
   the steady state, so the per-frame value is low.
