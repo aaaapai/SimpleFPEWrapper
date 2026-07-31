@@ -551,7 +551,7 @@ known vanilla vertex formats (representative, not captured verbatim):
 
 | phase | Minecraft site | reconstructed per-draw sequence |
 |---|---|---|
-| `mcchunk` | RenderGlobal, one large chunk | `glVertex/Color/TexCoordPointer` on a 28-byte VBO record (BLOCK format: 3f pos, 4ub colour, 2f uv, 2s lightmap), `glPushMatrix`/`glTranslatef`, `glDrawArrays(GL_QUADS)`, `glPopMatrix` |
+| `mcchunk` | RenderGlobal, one large chunk | `glVertex/Color/TexCoordPointer` on a 28-byte VBO record (BLOCK format: 3f pos, 4ub color, 2f uv, 2s lightmap), `glPushMatrix`/`glTranslatef`, `glDrawArrays(GL_QUADS)`, `glPopMatrix` |
 | `mcchunkmulti` | RenderGlobal, 16 chunks/frame | the same, plus `glClientActiveTexture(GL_TEXTURE1/0)` per chunk for the lightmap unit |
 | `mcgui` | Gui / GuiIngame | `glBindTexture`, `glEnable(GL_BLEND)`, `glBlendFunc`, `glDisable(GL_ALPHA_TEST)`, one `glBegin(GL_QUADS)` quad, then both toggles restored |
 | `mcfont` | FontRenderer | one `glBegin(GL_QUADS)` for the string, `glColor4f` + `glTexCoord2f` + `glVertex3f` per glyph |
@@ -586,7 +586,7 @@ comparison, the same 288 vertices in a single list would be ~1.5 us at
 0.38 us - so small-list replay carries roughly eight times a draw's overhead.
 
 This matters because it is exactly how Minecraft draws entities: every mob and
-every armour layer is a set of small compiled lists, a few hundred replays a
+every armor layer is a set of small compiled lists, a few hundred replays a
 frame. Not diagnosed further here; the likely candidates are the per-replay
 state commit and the batch flush each intervening matrix call forces.
 
