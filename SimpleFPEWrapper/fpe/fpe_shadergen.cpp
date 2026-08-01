@@ -7,6 +7,7 @@
 // End of Source File Header
 
 #include "fpe_shadergen.h"
+#include "../log.h"
 #include "types.h"
 #include <cstdio>
 #include <format>
@@ -1128,52 +1129,8 @@ constexpr std::string_view mg_fog_uniforms = "uniform vec4 FogColor;\n"
                                              "uniform float FogStart;\n"
                                              "uniform float FogEnd;\n";
 
-constexpr std::string_view mg_alpharef_uniform = "uniform float alpharef;\n";
-
-const std::string alpha_test(GLenum func, const std::string_view varname, const std::string_view alpharef) {
-    constexpr std::string_view fmt = R"(
-    // Alpha Test, func = {}
-    if (!({}.a {} {})) {{
-        discard;
-    }}
-)";
-
-    constexpr std::string_view fmt_eq = R"(
-    // Alpha Test, func = GL_EQUAL
-    if (abs({0}.a - {1}) > 0.00001) {{
-        discard;
-    }}
-)";
-
-    constexpr std::string_view fmt_neq = R"(
-    // Alpha Test, func = GL_NOTEQUAL
-    if (abs({0}.a - {1}) <= 0.00001) {{
-        discard;
-    }}
-)";
-
-    switch (func) {
-    case GL_NEVER:
-        return "    // Alpha Test\n"
-               "    discard;\n";
-    case GL_LESS:
-        return std::format(fmt, glEnumToString(func), varname, "<", alpharef);
-    case GL_EQUAL:
-        return std::format(fmt_eq, varname, alpharef);
-    case GL_LEQUAL:
-        return std::format(fmt, glEnumToString(func), varname, "<=", alpharef);
-    case GL_GREATER:
-        return std::format(fmt, glEnumToString(func), varname, ">", alpharef);
-    case GL_NOTEQUAL:
-        return std::format(fmt_neq, varname, alpharef);
-    case GL_GEQUAL:
-        return std::format(fmt, glEnumToString(func), varname, ">=", alpharef);
-    case GL_ALWAYS:
-        return "    // Alpha Test\n"
-               "    // GL_ALWAYS\n";
-    }
-    return std::string("    ALPHA TEST ERROR: unknown func: ") + glEnumToString(func);
-}
+constexpr std::string_view mg_alpharef_uniform = "uniform float alpharef;\n"
+                                                 "uniform int alphafunc;\n";
 
 std::string vp2in_name(GLenum vp, int index) {
     switch (vp) {
@@ -1201,6 +1158,12 @@ std::string vp2in_name(GLenum vp, int index) {
     }
     // LOG_E("ERROR: 1280 %s(%s, %d)", __func__, glEnumToString(vp), index)
     return "ERROR";
+}
+
+// Eye-space position is only needed for fog when the fog distance comes
+// from the fragment depth; GL_FOG_COORD sources it from the vertex instead.
+bool fog_needs_view_position(const fixed_function_state_t& state) {
+    return state.fpe_bools.fog_enable && state.fog_coord_src != GL_FOG_COORD;
 }
 
 std::string vp2out_name(GLenum vp, int index) {
@@ -1276,6 +1239,55 @@ int texture_unit_from_attribute(int attribute_index) {
     return unit >= 0 && unit < MAX_TEX ? unit : -1;
 }
 
+
+// Any texgen coordinate live on a textured unit?
+bool unit_uses_texgen(const fixed_function_state_t& state, int unit) {
+    if (!state.fpe_bools.texture_2d_enable[unit]) return false;
+    for (int c = 0; c < 4; ++c)
+        if (state.fpe_bools.texture_gen_enable[unit][c]) return true;
+    return false;
+}
+
+bool any_clip_plane(const fixed_function_state_t& state) {
+    for (int i = 0; i < 6; ++i)
+        if (state.fpe_bools.clip_plane_enable[i]) return true;
+    return false;
+}
+
+bool any_texgen(const fixed_function_state_t& state) {
+    for (int i = 0; i < MAX_TEX; ++i)
+        if (unit_uses_texgen(state, i)) return true;
+    return false;
+}
+
+// Do any live texgen coords need eye-space data / the normal?
+bool texgen_needs_eye(const fixed_function_state_t& state) {
+    for (int i = 0; i < MAX_TEX; ++i) {
+        if (!state.fpe_bools.texture_2d_enable[i]) continue;
+        for (int c = 0; c < 4; ++c) {
+            if (!state.fpe_bools.texture_gen_enable[i][c]) continue;
+            const GLenum mode = state.texture_gen_mode[i][c];
+            if (mode == GL_EYE_LINEAR || mode == GL_SPHERE_MAP || mode == GL_NORMAL_MAP ||
+                mode == GL_REFLECTION_MAP)
+                return true;
+        }
+    }
+    return false;
+}
+
+bool texgen_needs_normal(const fixed_function_state_t& state) {
+    for (int i = 0; i < MAX_TEX; ++i) {
+        if (!state.fpe_bools.texture_2d_enable[i]) continue;
+        for (int c = 0; c < 4; ++c) {
+            if (!state.fpe_bools.texture_gen_enable[i][c]) continue;
+            const GLenum mode = state.texture_gen_mode[i][c];
+            if (mode == GL_SPHERE_MAP || mode == GL_NORMAL_MAP || mode == GL_REFLECTION_MAP)
+                return true;
+        }
+    }
+    return false;
+}
+
 void add_vs_inout(const fixed_function_state_t& state, scratch_t& scratch, std::string& vs) {
     auto& vpa = state.normalized_vpa;
     // LOG_D("[shadergen] enabled_ptr: 0x%x", vpa.enabled_pointers)
@@ -1326,9 +1338,12 @@ void add_vs_inout(const fixed_function_state_t& state, scratch_t& scratch, std::
             linkage += out_name;
             linkage += ";\n";
 
+            const bool color_varying = usage == GL_COLOR_ARRAY && state.shade_model == GL_FLAT;
+            if (color_varying) vs += "flat ";
             vs += "out ";
             vs += linkage;
 
+            if (color_varying) scratch.last_stage_linkage += "flat ";
             scratch.last_stage_linkage += "in " + linkage;
 
             // TODO: Fog / vertex lighting. Texture coordinates first pass
@@ -1346,48 +1361,97 @@ void add_vs_inout(const fixed_function_state_t& state, scratch_t& scratch, std::
                 scratch.has_vertex_color = true;
             }
             if (usage == GL_NORMAL_ARRAY) scratch.has_normal_input = true;
+            if (usage == GL_FOG_COORD_ARRAY) scratch.has_fog_coord_input = true;
         }
     }
 
+    // GL_FLAT selects the provoking vertex for the primary color only;
+    // ESSL 3.00 expresses that with the flat qualifier on both sides.
+    const char* flat_q = state.shade_model == GL_FLAT ? "flat " : "";
     if (state.fpe_bools.lighting_enable && !scratch.has_vertex_color) {
-        vs += "out vec4 vertexColor;\n";
-        scratch.last_stage_linkage += "in vec4 vertexColor;\n";
+        vs += std::format("{}out vec4 vertexColor;\n", flat_q);
+        scratch.last_stage_linkage += std::format("{}in vec4 vertexColor;\n", flat_q);
         scratch.has_vertex_color = true;
     }
     if (state.fpe_bools.lighting_enable && state.light_model_two_side) {
-        vs += "out vec4 vertexBackColor;\n";
-        scratch.last_stage_linkage += "in vec4 vertexBackColor;\n";
+        vs += std::format("{}out vec4 vertexBackColor;\n", flat_q);
+        scratch.last_stage_linkage += std::format("{}in vec4 vertexBackColor;\n", flat_q);
         scratch.has_back_vertex_color = true;
     }
+    if (state.fpe_bools.lighting_enable && state.light_model_color_ctrl == GL_SEPARATE_SPECULAR_COLOR) {
+        // Specular rides its own varying and is added AFTER texturing.
+        vs += std::format("{}out vec3 vertexSpecular;\n", flat_q);
+        scratch.last_stage_linkage += std::format("{}in vec3 vertexSpecular;\n", flat_q);
+        if (state.light_model_two_side) {
+            vs += std::format("{}out vec3 vertexBackSpecular;\n", flat_q);
+            scratch.last_stage_linkage += std::format("{}in vec3 vertexBackSpecular;\n", flat_q);
+        }
+    }
 
-    if (state.fpe_bools.fog_enable) {
+    // Units fed purely by texgen still need their varying.
+    for (int i = 0; i < MAX_TEX; ++i) {
+        if (!unit_uses_texgen(state, i) || scratch.has_texcoord[i]) continue;
+        vs += std::format("out vec4 texCoord{};\n", i);
+        scratch.last_stage_linkage += std::format("in vec4 texCoord{};\n", i);
+        scratch.has_texcoord[i] = true;
+        scratch.texgen_no_input[i] = true; // the texgen body block writes it
+    }
+
+    if (fog_needs_view_position(state)) {
         vs += "out vec3 vViewPosition;\n";
+    }
+    for (int i = 0; i < 6; ++i) {
+        if (!state.fpe_bools.clip_plane_enable[i]) continue;
+        vs += std::format("out float vClipDistance{};\n", i);
+        scratch.last_stage_linkage += std::format("in float vClipDistance{};\n", i);
     }
 }
 
 void add_vs_uniforms(const fixed_function_state_t& state, scratch_t& scratch, std::string& vs) {
     // Transformation matrix
     vs += "uniform mat4 ModelViewProjMat;\n";
-    if (state.fpe_bools.fog_enable) {
-        vs += "uniform mat4 ModelViewMat;\n";
+    vs += "uniform float PointSize;\n"; // GLES has no glPointSize state
+    if (state.fpe_bools.fog_enable || state.fpe_bools.lighting_enable || texgen_needs_eye(state) ||
+        any_clip_plane(state)) {
+        vs += "uniform mat4 ModelViewMat;\n"; // eye-space position source
+    }
+    for (int i = 0; i < 6; ++i) {
+        if (state.fpe_bools.clip_plane_enable[i]) vs += std::format("uniform vec4 ClipPlane{};\n", i);
+    }
+    if (!state.fpe_bools.lighting_enable && texgen_needs_normal(state)) {
+        vs += "uniform mat3 NormalMat;\n"; // sphere/normal/reflection maps
+    }
+    for (int i = 0; i < MAX_TEX; ++i) {
+        if (!unit_uses_texgen(state, i)) continue;
+        vs += std::format("uniform vec4 TexGen{0}ObjPlanes[4];\n"
+                          "uniform vec4 TexGen{0}EyePlanes[4];\n",
+                          i);
     }
     if (state.fpe_bools.lighting_enable) {
         vs += "uniform mat3 NormalMat;\n"
               "uniform vec4 LightModelAmbient;\n"
               "uniform vec4 FrontMaterialAmbient;\n"
               "uniform vec4 FrontMaterialDiffuse;\n"
-              "uniform vec4 FrontMaterialEmission;\n";
+              "uniform vec4 FrontMaterialEmission;\n"
+              "uniform vec4 FrontMaterialSpecular;\n"
+              "uniform float FrontMaterialShininess;\n";
         if (state.light_model_two_side) {
             vs += "uniform vec4 BackMaterialAmbient;\n"
                   "uniform vec4 BackMaterialDiffuse;\n"
-                  "uniform vec4 BackMaterialEmission;\n";
+                  "uniform vec4 BackMaterialEmission;\n"
+                  "uniform vec4 BackMaterialSpecular;\n"
+                  "uniform float BackMaterialShininess;\n";
         }
         for (int i = 0; i < MAX_LIGHTS; ++i) {
             if (!state.fpe_bools.light_enable[i]) continue;
-            vs += std::format("uniform vec4 Light{}Ambient;\n"
-                              "uniform vec4 Light{}Diffuse;\n"
-                              "uniform vec4 Light{}Position;\n",
-                              i, i, i);
+            vs += std::format("uniform vec4 Light{0}Ambient;\n"
+                              "uniform vec4 Light{0}Diffuse;\n"
+                              "uniform vec4 Light{0}Specular;\n"
+                              "uniform vec4 Light{0}Position;\n"
+                              "uniform vec3 Light{0}Attenuation;\n" // kc, kl, kq
+                              "uniform vec3 Light{0}SpotDirection;\n"
+                              "uniform vec2 Light{0}SpotParams;\n", // cos(cutoff) or -2, exponent
+                              i);
         }
     }
     for (int i = 0; i < MAX_TEX; ++i) {
@@ -1421,9 +1485,10 @@ void add_color_material(const fixed_function_state_t& state, GLenum face, const 
                           "    {}Diffuse = incomingColor;\n",
                           prefix, prefix);
         break;
+    case GL_SPECULAR:
+        vs += std::format("    {}Specular = incomingColor;\n", prefix);
+        break;
     default:
-        // Specular color material is retained in state, but this compatibility
-        // shader intentionally implements the ambient/diffuse vanilla path.
         break;
     }
 }
@@ -1431,15 +1496,52 @@ void add_color_material(const fixed_function_state_t& state, GLenum face, const 
 void add_lighting_calculation(const fixed_function_state_t& state, const std::string& prefix,
                               const std::string& normal, const std::string& output, std::string& vs) {
     vs += std::format(
-        "    vec3 {0}Lit = ({0}Emission + LightModelAmbient * {0}Ambient).rgb;\n", prefix);
+        "    vec3 {0}Lit = ({0}Emission + LightModelAmbient * {0}Ambient).rgb;\n"
+        "    vec3 {0}SpecularSum = vec3(0.0);\n",
+        prefix);
+    // Viewer direction for the Blinn half-vector: the spec's non-local
+    // viewer is the constant (0,0,1); local viewer looks at the eye origin.
+    vs += std::format("    vec3 {}EyeDir = {};\n", prefix,
+                      state.light_model_local_viewer ? "normalize(-eyePosition.xyz)"
+                                                     : "vec3(0.0, 0.0, 1.0)");
     for (int i = 0; i < MAX_LIGHTS; ++i) {
         if (!state.fpe_bools.light_enable[i]) continue;
         vs += std::format(
-            "    vec3 {2}LightDirection{0} = normalize(Light{0}Position.xyz);\n"
+            // Directional (w == 0) vs positional lights branch on uniform
+            // data, so light parameter changes never require a new program.
+            "    vec3 {2}LightDirection{0};\n"
+            "    float {2}Attenuation{0} = 1.0;\n"
+            "    if (Light{0}Position.w == 0.0) {{\n"
+            "        {2}LightDirection{0} = normalize(Light{0}Position.xyz);\n"
+            "    }} else {{\n"
+            "        vec3 {2}ToLight{0} = Light{0}Position.xyz - eyePosition.xyz;\n"
+            "        float {2}Dist{0} = length({2}ToLight{0});\n"
+            "        {2}LightDirection{0} = {2}ToLight{0} / max({2}Dist{0}, 1e-6);\n"
+            "        {2}Attenuation{0} = 1.0 / (Light{0}Attenuation.x + Light{0}Attenuation.y * {2}Dist{0} +\n"
+            "                                  Light{0}Attenuation.z * {2}Dist{0} * {2}Dist{0});\n"
+            "        if (Light{0}SpotParams.x > -1.5) {{\n" // cutoff != 180
+            "            float {2}SpotDot{0} = dot(-{2}LightDirection{0}, normalize(Light{0}SpotDirection));\n"
+            "            {2}Attenuation{0} *= {2}SpotDot{0} >= Light{0}SpotParams.x\n"
+            "                ? pow(max({2}SpotDot{0}, 0.0), Light{0}SpotParams.y) : 0.0;\n"
+            "        }}\n"
+            "    }}\n"
             "    float {2}DiffuseFactor{0} = max(dot({1}, {2}LightDirection{0}), 0.0);\n"
-            "    {2}Lit += (Light{0}Ambient * {2}Ambient).rgb;\n"
-            "    {2}Lit += {2}DiffuseFactor{0} * (Light{0}Diffuse * {2}Diffuse).rgb;\n",
-            i, normal, prefix);
+            "    {2}Lit += {2}Attenuation{0} * (Light{0}Ambient * {2}Ambient).rgb;\n"
+            "    {2}Lit += {2}Attenuation{0} * {2}DiffuseFactor{0} * (Light{0}Diffuse * {2}Diffuse).rgb;\n"
+            "    if ({2}DiffuseFactor{0} > 0.0) {{\n"
+            "        vec3 {2}Half{0} = normalize({2}LightDirection{0} + {2}EyeDir);\n"
+            "        float {2}NdotH{0} = max(dot({1}, {2}Half{0}), 0.0);\n"
+            "        {2}SpecularSum += {2}Attenuation{0} * pow({2}NdotH{0}, max({3}, 1e-4)) *\n"
+            "                          (Light{0}Specular * {2}Specular).rgb;\n"
+            "    }}\n",
+            i, normal, prefix,
+            prefix == std::string("front") ? "FrontMaterialShininess" : "BackMaterialShininess");
+    }
+    if (state.light_model_color_ctrl == GL_SEPARATE_SPECULAR_COLOR) {
+        vs += std::format("    vertex{}Specular = clamp({}SpecularSum, 0.0, 1.0);\n",
+                          prefix == std::string("front") ? "" : "Back", prefix);
+    } else {
+        vs += std::format("    {0}Lit += {0}SpecularSum;\n", prefix);
     }
     vs += std::format("    {} = vec4(clamp({}Lit, 0.0, 1.0), clamp({}Diffuse.a, 0.0, 1.0));\n",
                       output, prefix, prefix);
@@ -1448,12 +1550,78 @@ void add_lighting_calculation(const fixed_function_state_t& state, const std::st
 void add_vs_body(const fixed_function_state_t& state, scratch_t& scratch, std::string& vs) {
     vs += "void main() {\n"
           //            "   gl_Position = ProjMat * ModelViewMat * vec4(Position, 1.0);\n";
-          "    gl_Position = ModelViewProjMat * Position;\n";
-    if (state.fpe_bools.fog_enable) {
-        vs += "    vec4 viewPosition = ModelViewMat * Position;\n"
-              "    vViewPosition = viewPosition.xyz;\n";
+          "    gl_Position = ModelViewProjMat * Position;\n"
+          "    gl_PointSize = PointSize;\n";
+    if (fog_needs_view_position(state) || state.fpe_bools.lighting_enable ||
+        texgen_needs_eye(state) || any_clip_plane(state)) {
+        vs += "    vec4 eyePosition = ModelViewMat * Position;\n";
+    }
+    for (int i = 0; i < 6; ++i) {
+        if (state.fpe_bools.clip_plane_enable[i])
+            vs += std::format("    vClipDistance{0} = dot(ClipPlane{0}, eyePosition);\n", i);
+    }
+    if (fog_needs_view_position(state)) {
+        vs += "    vViewPosition = eyePosition.xyz;\n";
     }
     vs += scratch.vs_body;
+
+    if (any_texgen(state)) {
+        if (texgen_needs_normal(state)) {
+            vs += scratch.has_normal_input ? "    vec3 texgenNormal = normalize(NormalMat * Normal);\n"
+                                           : "    vec3 texgenNormal = normalize(NormalMat * vec3(0.0, 0.0, 1.0));\n";
+        }
+        if (texgen_needs_eye(state)) {
+            vs += "    vec3 texgenU = normalize(eyePosition.xyz);\n";
+        }
+        for (int i = 0; i < MAX_TEX; ++i) {
+            if (!unit_uses_texgen(state, i)) continue;
+            // Generation happens BEFORE the texture matrix; rebuild the
+            // source coordinate, splice generated components in, then apply
+            // TexMat (overwriting the pass-through assignment above).
+            vs += std::format("    vec4 tgsrc{0} = {1};\n", i,
+                              scratch.texgen_no_input[i] ? std::string("vec4(0.0, 0.0, 0.0, 1.0)")
+                                                         : std::format("UV{}", i));
+            bool needs_reflect = false, needs_sphere = false;
+            for (int c = 0; c < 4; ++c) {
+                if (!state.fpe_bools.texture_gen_enable[i][c]) continue;
+                const GLenum mode = state.texture_gen_mode[i][c];
+                if (mode == GL_SPHERE_MAP) needs_sphere = true;
+                if (mode == GL_SPHERE_MAP || mode == GL_REFLECTION_MAP) needs_reflect = true;
+            }
+            if (needs_reflect)
+                vs += std::format("    vec3 tgR{0} = reflect(texgenU, texgenNormal);\n", i);
+            if (needs_sphere)
+                vs += std::format("    float tgM{0} = 2.0 * sqrt(tgR{0}.x * tgR{0}.x + tgR{0}.y * tgR{0}.y +\n"
+                                  "                              (tgR{0}.z + 1.0) * (tgR{0}.z + 1.0));\n",
+                                  i);
+            static const char* comp = "xyzw";
+            for (int c = 0; c < 4; ++c) {
+                if (!state.fpe_bools.texture_gen_enable[i][c]) continue;
+                const GLenum mode = state.texture_gen_mode[i][c];
+                std::string value;
+                switch (mode) {
+                case GL_OBJECT_LINEAR:
+                    value = std::format("dot(TexGen{}ObjPlanes[{}], Position)", i, c);
+                    break;
+                case GL_EYE_LINEAR:
+                    value = std::format("dot(TexGen{}EyePlanes[{}], eyePosition)", i, c);
+                    break;
+                case GL_SPHERE_MAP:
+                    value = std::format("tgR{0}.{1} / max(tgM{0}, 1e-6) + 0.5", i, comp[c]);
+                    break;
+                case GL_NORMAL_MAP:
+                    value = c < 3 ? std::format("texgenNormal.{}", comp[c]) : std::string("1.0");
+                    break;
+                case GL_REFLECTION_MAP:
+                default:
+                    value = c < 3 ? std::format("tgR{}.{}", i, comp[c]) : std::string("1.0");
+                    break;
+                }
+                vs += std::format("    tgsrc{}.{} = {};\n", i, comp[c], value);
+            }
+            vs += std::format("    texCoord{0} = TexMat{0} * tgsrc{0};\n", i);
+        }
+    }
 
     if (state.fpe_bools.lighting_enable) {
         vs += scratch.has_color_input ? "    vec4 incomingColor = Color;\n"
@@ -1469,14 +1637,16 @@ void add_vs_body(const fixed_function_state_t& state, scratch_t& scratch, std::s
 
         vs += "    vec4 frontAmbient = FrontMaterialAmbient;\n"
               "    vec4 frontDiffuse = FrontMaterialDiffuse;\n"
-              "    vec4 frontEmission = FrontMaterialEmission;\n";
+              "    vec4 frontEmission = FrontMaterialEmission;\n"
+              "    vec4 frontSpecular = FrontMaterialSpecular;\n";
         add_color_material(state, GL_FRONT, "front", vs);
         add_lighting_calculation(state, "front", "transformedNormal", "vertexColor", vs);
 
         if (state.light_model_two_side) {
             vs += "    vec4 backAmbient = BackMaterialAmbient;\n"
                   "    vec4 backDiffuse = BackMaterialDiffuse;\n"
-                  "    vec4 backEmission = BackMaterialEmission;\n";
+                  "    vec4 backEmission = BackMaterialEmission;\n"
+                  "    vec4 backSpecular = BackMaterialSpecular;\n";
             add_color_material(state, GL_BACK, "back", vs);
             add_lighting_calculation(state, "back", "-transformedNormal", "vertexBackColor", vs);
         }
@@ -1484,11 +1654,12 @@ void add_vs_body(const fixed_function_state_t& state, scratch_t& scratch, std::s
     vs += "}\n";
 }
 
-void add_fs_uniforms(const fixed_function_state_t& state, scratch_t& scratch, std::string& fs) {
+void add_fs_uniforms(const fixed_function_state_t& state, [[maybe_unused]] scratch_t& scratch, std::string& fs) {
+    if (state.fpe_bools.polygon_stipple_enable) fs += "uniform uint PolygonStipple[32];\n";
     for (int i = 0; i < MAX_TEX; ++i) {
         if (state.fpe_bools.texture_2d_enable[i]) {
             fs += std::format("uniform sampler2D Sampler{};\n", i);
-            if (state.texture_env_mode[i] == GL_BLEND) {
+            if (state.texture_env_mode[i] == GL_BLEND || state.texture_env_mode[i] == GL_COMBINE) {
                 fs += std::format("uniform vec4 TexEnvColor{};\n", i);
             }
         }
@@ -1498,19 +1669,83 @@ void add_fs_uniforms(const fixed_function_state_t& state, scratch_t& scratch, st
         fs += mg_fog_uniforms;
     }
 
-    if (state.fpe_bools.alpha_test_enable) {
-        fs += mg_alpharef_uniform;
-    }
+    // Alpha test is uniform-driven (0 = off/GL_ALWAYS): declared in every
+    // program so GL_ALPHA_TEST toggles and glAlphaFunc changes never mint a
+    // new program. The branch below is uniform-coherent, which drivers
+    // specialize.
+    fs += mg_alpharef_uniform;
 }
 
 void add_fs_inout(const fixed_function_state_t& state, scratch_t& scratch, std::string& fs) {
     // Linking from VS
     fs += scratch.last_stage_linkage;
     fs += "\n";
-    if (state.fpe_bools.fog_enable) {
+    if (fog_needs_view_position(state)) {
         fs += "in vec3 vViewPosition;\n";
     }
     fs += "out vec4 FragColor;\n";
+}
+
+// GL_COMBINE argument expression: source selection x operand mapping.
+// `unit` is the combiner's unit; texcolorN may only be referenced for units
+// already sampled (ascending order), otherwise the crossbar reads black.
+std::string combine_argument(const fixed_function_state_t& state, const texture_env_t& env, int unit,
+                             int arg, bool rgb_domain) {
+    const GLenum source = rgb_domain ? env.source_rgb[arg] : env.source_alpha[arg];
+    std::string src;
+    if (source == GL_TEXTURE) {
+        src = std::format("texcolor{}", unit);
+    } else if (source >= GL_TEXTURE0 && source < GL_TEXTURE0 + MAX_TEX) {
+        const int n = static_cast<int>(source - GL_TEXTURE0);
+        src = (n <= unit && state.fpe_bools.texture_2d_enable[n]) ? std::format("texcolor{}", n)
+                                                                  : std::string("vec4(0.0)");
+    } else if (source == GL_CONSTANT) {
+        src = std::format("TexEnvColor{}", unit);
+    } else if (source == GL_PRIMARY_COLOR) {
+        src = "primaryColor";
+    } else { // GL_PREVIOUS
+        src = "color";
+    }
+    const GLenum operand = rgb_domain ? env.operand_rgb[arg] : env.operand_alpha[arg];
+    if (rgb_domain) {
+        switch (operand) {
+        case GL_ONE_MINUS_SRC_COLOR:
+            return std::format("(vec3(1.0) - {}.rgb)", src);
+        case GL_SRC_ALPHA:
+            return std::format("vec3({}.a)", src);
+        case GL_ONE_MINUS_SRC_ALPHA:
+            return std::format("vec3(1.0 - {}.a)", src);
+        case GL_SRC_COLOR:
+        default:
+            return std::format("{}.rgb", src);
+        }
+    }
+    return operand == GL_ONE_MINUS_SRC_ALPHA ? std::format("(1.0 - {}.a)", src)
+                                             : std::format("{}.a", src);
+}
+
+std::string combine_expression(GLenum function, const std::string& a0, const std::string& a1,
+                               const std::string& a2, bool rgb_domain) {
+    switch (function) {
+    case GL_REPLACE:
+        return a0;
+    case GL_ADD:
+        return std::format("({} + {})", a0, a1);
+    case GL_ADD_SIGNED:
+        return std::format("({} + {} - {})", a0, a1, rgb_domain ? "vec3(0.5)" : "0.5");
+    case GL_INTERPOLATE:
+        return std::format("mix({1}, {0}, {2})", a0, a1, a2);
+    case GL_SUBTRACT:
+        return std::format("({} - {})", a0, a1);
+    case GL_DOT3_RGB:
+    case GL_DOT3_RGBA:
+        if (rgb_domain)
+            return std::format("vec3(4.0 * dot({} - vec3(0.5), {} - vec3(0.5)))", a0, a1);
+        return a0; // alpha handled by the caller for DOT3_RGBA
+    case GL_MODULATE:
+    default:
+        return std::format("({} * {})", a0, a1);
+    }
 }
 
 void add_fs_body(const fixed_function_state_t& state, scratch_t& scratch, std::string& fs) {
@@ -1521,17 +1756,26 @@ void add_fs_body(const fixed_function_state_t& state, scratch_t& scratch, std::s
         case GL_LINEAR:
             fs += mg_fog_linear_func;
             break;
-        case GL_EXP:
-            fs += mg_fog_exp_func;
-            break;
         case GL_EXP2:
             fs += mg_fog_exp2_func;
+            break;
+        case GL_EXP:
+        default: // validated at the state entry; keep the GLSL compilable
+            fs += mg_fog_exp_func;
             break;
         }
     }
 
     // TODO: Replace this hardcode with something better...
     fs += "void main() {\n";
+    for (int i = 0; i < 6; ++i) {
+        if (state.fpe_bools.clip_plane_enable[i])
+            fs += std::format("    if (vClipDistance{} < 0.0) discard;\n", i);
+    }
+    if (state.fpe_bools.polygon_stipple_enable) {
+        fs += "    if ((PolygonStipple[int(gl_FragCoord.y) & 31] &\n"
+              "         (1u << (uint(gl_FragCoord.x) & 31u))) == 0u) discard;\n";
+    }
 
     if (scratch.has_back_vertex_color)
         fs += "    vec4 color = gl_FrontFacing ? vertexColor : vertexBackColor;\n";
@@ -1543,6 +1787,12 @@ void add_fs_body(const fixed_function_state_t& state, scratch_t& scratch, std::s
     for (int i = 0; i < MAX_TEX; ++i) {
         if (!state.fpe_bools.texture_2d_enable[i]) continue;
 
+        if (!scratch.primary_color_saved) {
+            // COMBINE's GL_PRIMARY_COLOR must reference the pre-texturing
+            // color regardless of how many units already ran.
+            fs += "    vec4 primaryColor = color;\n";
+            scratch.primary_color_saved = true;
+        }
         const std::string coord =
             scratch.has_texcoord[i] ? std::format("texCoord{}.xy", i) : "vec2(0.0)";
         fs += std::format("\n"
@@ -1568,9 +1818,23 @@ void add_fs_body(const fixed_function_state_t& state, scratch_t& scratch, std::s
                               "    color.a *= texcolor{0}.a;\n",
                               i);
             break;
-        case GL_COMBINE:
-            // Minecraft's fixed-function lightmap config uses COMBINE with
-            // MODULATE for texture and previous color.
+        case GL_COMBINE: {
+            const auto& env = glstate_t::get_instance().fpe_uniform.texture_env[i];
+            const std::string r0 = combine_argument(state, env, i, 0, true);
+            const std::string r1 = combine_argument(state, env, i, 1, true);
+            const std::string r2 = combine_argument(state, env, i, 2, true);
+            const std::string a0 = combine_argument(state, env, i, 0, false);
+            const std::string a1 = combine_argument(state, env, i, 1, false);
+            const std::string a2 = combine_argument(state, env, i, 2, false);
+            const std::string rgb = combine_expression(env.combine_rgb, r0, r1, r2, true);
+            // DOT3_RGBA replicates the dot product into alpha as well.
+            const std::string alpha = env.combine_rgb == GL_DOT3_RGBA
+                                          ? std::format("4.0 * dot({} - vec3(0.5), {} - vec3(0.5))", r0, r1)
+                                          : combine_expression(env.combine_alpha, a0, a1, a2, false);
+            fs += std::format("    color = clamp(vec4(({}) * {:.1f}, ({}) * {:.1f}), 0.0, 1.0);\n",
+                              rgb, env.rgb_scale, alpha, env.alpha_scale);
+            break;
+        }
         case GL_MODULATE:
         default:
             fs += std::format("    color *= texcolor{};\n", i);
@@ -1578,27 +1842,54 @@ void add_fs_body(const fixed_function_state_t& state, scratch_t& scratch, std::s
         }
     }
 
-    // Alpha test
-    if (state.fpe_bools.alpha_test_enable)
-        fs += alpha_test(state.alpha_func, "color", "alpharef");
-    else
-        fs += "    // Alpha Test\n"
-              "    // (Disabled)\n";
+    if (state.fpe_bools.lighting_enable &&
+        state.light_model_color_ctrl == GL_SEPARATE_SPECULAR_COLOR) {
+        if (state.light_model_two_side)
+            fs += "    color.rgb += gl_FrontFacing ? vertexSpecular : vertexBackSpecular;\n";
+        else
+            fs += "    color.rgb += vertexSpecular;\n";
+    }
+
+    // Alpha test: uniform-selected comparison, GL_NEVER..GL_GEQUAL encoded
+    // as 1..7 (send_uniforms), 0 covers both disabled and GL_ALWAYS.
+    fs += "    // Alpha Test (uniform-driven)\n"
+          "    if (alphafunc != 0) {\n"
+          "        bool alphapass;\n"
+          "        if      (alphafunc == 1) alphapass = false;\n"
+          "        else if (alphafunc == 2) alphapass = color.a < alpharef;\n"
+          "        else if (alphafunc == 3) alphapass = abs(color.a - alpharef) <= 0.00001;\n"
+          "        else if (alphafunc == 4) alphapass = color.a <= alpharef;\n"
+          "        else if (alphafunc == 5) alphapass = color.a > alpharef;\n"
+          "        else if (alphafunc == 6) alphapass = abs(color.a - alpharef) > 0.00001;\n"
+          "        else                     alphapass = color.a >= alpharef;\n"
+          "        if (!alphapass) discard;\n"
+          "    }\n";
 
     // Fog calculation
     if (state.fpe_bools.fog_enable) {
-        // Fixed-function fog uses eye-space depth by default. Radial distance
-        // is only selected through the optional NV fog-distance extension.
-        fs += "    float distance = abs(vViewPosition.z);\n";
+        // GL_FOG_COORD_SRC (GL 1.4 core) picks between the interpolated
+        // eye-space depth and the per-vertex fog coordinate. Radial distance
+        // is a separate, optional NV extension and stays unimplemented.
+        // Per spec the fog coordinate is used unsigned.
+        if (state.fog_coord_src == GL_FOG_COORD && scratch.has_fog_coord_input) {
+            fs += "    float distance = abs(vertexFogCoord);\n";
+        } else if (state.fog_coord_src == GL_FOG_COORD) {
+            // Source selected but nothing feeds the coordinate: GL then uses
+            // the current value, which without any glFogCoord* call is 0.
+            fs += "    float distance = 0.0;\n";
+        } else {
+            fs += "    float distance = abs(vViewPosition.z);\n";
+        }
         switch (state.fog_mode) {
         case GL_LINEAR:
             fs += "    float fogFactor = fog_linear(distance, FogStart, FogEnd);\n";
             break;
-        case GL_EXP:
-            fs += "    float fogFactor = fog_exp(distance, FogDensity);\n";
-            break;
         case GL_EXP2:
             fs += "    float fogFactor = fog_exp2(distance, FogDensity);\n";
+            break;
+        case GL_EXP:
+        default: // fogFactor must exist: the apply_fog line below reads it
+            fs += "    float fogFactor = fog_exp(distance, FogDensity);\n";
             break;
         }
         fs += "    color.rgb = apply_fog(color.rgb, FogColor.rgb, fogFactor);\n";
@@ -1683,7 +1974,7 @@ int program_t::compile_shader(GLenum shader_type, const char* src) {
     if (!success) {
         g_glFuncs.glGetShaderInfoLog(shader, sizeof(compile_info), NULL, compile_info);
 
-        printf("[FPE] %s shader compile error: %s\nShader source:\n%s\n",
+        SFPEW_LOGE("%s shader compile error: %s\nShader source:\n%s",
                (shader_type == GL_VERTEX_SHADER) ? "vertex" : "fragment", compile_info, src);
         g_glFuncs.glDeleteShader(shader);
 #if DEBUG || GLOBAL_DEBUG
@@ -1713,7 +2004,7 @@ int program_t::link_program(GLuint vs, GLuint fs) {
     if (!success) {
         g_glFuncs.glGetProgramInfoLog(program, sizeof(compile_info), NULL, compile_info);
 
-        printf("[FPE] program link error: %s\n", compile_info);
+        SFPEW_LOGE("program link error: %s", compile_info);
         g_glFuncs.glDeleteProgram(program);
 #if DEBUG || GLOBAL_DEBUG
         abort();

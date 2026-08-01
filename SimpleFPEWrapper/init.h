@@ -12,16 +12,170 @@
 #include <stdexcept>
 #include "backend/loader.h"
 
-#define SFPEW_APIENTRY __attribute__((visibility("default"))) extern "C"
+#define SFPEW_APIENTRY extern "C" __attribute__((visibility("default")))
 extern SFPEW::External::EGLFunctionsTable g_eglFuncs;
 extern SFPEW::External::BackendGLFunctionsTable g_glFuncs;
 
+// Lazily resolves the EGL/GL backend tables on first use. Returns false if
+// the backend is unavailable; callers must degrade to a no-op then. Never
+// throws and never issues GL calls by itself.
+bool sfpewEnsureBackend() noexcept;
+
+GLenum sfpewLogicalActiveTexture();
+GLuint sfpewLogicalTextureBinding(GLenum target);
+// Changes whenever the active texture unit or any texture binding does.
+uint64_t sfpewTextureStateGeneration();
+GLint sfpewLogicalProgram();
+GLuint sfpewLogicalArrayBufferBinding();
+GLuint sfpewLogicalVertexArrayBinding();
+SFPEW_APIENTRY void glBindVertexArray(GLuint array);
+SFPEW_APIENTRY void glDeleteVertexArrays(GLsizei n, const GLuint* arrays);
+GLuint sfpewLogicalElementArrayBufferBinding();
+GLuint sfpewLogicalVAOBinding();
+// True when a pixel pack/unpack buffer is bound: CPU pixel conversions
+// must pass through untouched then (plans/10 10.1).
+bool sfpewUnpackPboBound();
+bool sfpewPackPboBound();
+void sfpewSetGenerateMipmap(GLenum target, GLuint texture, bool enable);
+void sfpewMaybeGenerateMipmap(GLenum target);
+void sfpewRememberTextureSize(GLuint texture, GLsizei width, GLsizei height);
+SFPEW_APIENTRY void glGetTexImage(GLenum target, GLint level, GLenum format, GLenum type, GLvoid* pixels);
+SFPEW_APIENTRY void glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, GLvoid* pixels);
+
+SFPEW_APIENTRY GLenum glGetError();
+SFPEW_APIENTRY GLuint glCreateShader(GLenum type);
+SFPEW_APIENTRY void glDeleteShader(GLuint shader);
+SFPEW_APIENTRY void glShaderSource(GLuint shader, GLsizei count, const GLchar* const* string, const GLint* length);
+SFPEW_APIENTRY void glCompileShader(GLuint shader);
+SFPEW_APIENTRY void glGetShaderSource(GLuint shader, GLsizei bufSize, GLsizei* length, GLchar* source);
+SFPEW_APIENTRY void glGetShaderInfoLog(GLuint shader, GLsizei bufSize, GLsizei* length, GLchar* infoLog);
+SFPEW_APIENTRY void glLinkProgram(GLuint program);
+SFPEW_APIENTRY void glAttachShader(GLuint program, GLuint shader);
+SFPEW_APIENTRY void glDetachShader(GLuint program, GLuint shader);
+SFPEW_APIENTRY void glDeleteProgram(GLuint program);
+SFPEW_APIENTRY void glGetShaderiv(GLuint shader, GLenum pname, GLint* params);
+SFPEW_APIENTRY void glGetProgramiv(GLuint program, GLenum pname, GLint* params);
+SFPEW_APIENTRY void glGetAttachedShaders(GLuint program, GLsizei maxCount, GLsizei* count, GLuint* shaders);
+SFPEW_APIENTRY void glGetProgramInfoLog(GLuint program, GLsizei bufSize, GLsizei* length, GLchar* infoLog);
+SFPEW_APIENTRY GLint glGetUniformLocation(GLuint program, const GLchar* name);
+SFPEW_APIENTRY GLint glGetAttribLocation(GLuint program, const GLchar* name);
+SFPEW_APIENTRY void glRenderbufferStorage(GLenum target, GLenum internalformat, GLsizei width, GLsizei height);
+SFPEW_APIENTRY void glRenderbufferStorageMultisample(GLenum target, GLsizei samples, GLenum internalformat,
+                                                     GLsizei width, GLsizei height);
+SFPEW_APIENTRY void glFramebufferTexture1D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture,
+                                           GLint level);
+SFPEW_APIENTRY void glFramebufferTexture3D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture,
+                                           GLint level, GLint zoffset);
+SFPEW_APIENTRY void* glMapBuffer(GLenum target, GLenum access);
+SFPEW_APIENTRY void glGetBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, void* data);
+void sfpewForgetUserProgram(GLuint program);
+extern "C" {
+GLuint sfpewCreateShaderObjectARB(GLenum type);
+GLuint sfpewCreateProgramObjectARB(void);
+void sfpewDeleteObjectARB(GLuint object);
+void sfpewAttachObjectARB(GLuint program, GLuint shader);
+void sfpewDetachObjectARB(GLuint program, GLuint shader);
+void sfpewGetObjectParameterivARB(GLuint object, GLenum pname, GLint* params);
+void sfpewGetInfoLogARB(GLuint object, GLsizei maxLength, GLsizei* length, GLchar* infoLog);
+GLuint sfpewGetHandleARB(GLenum pname);
+}
+SFPEW_APIENTRY void glWindowPos2d(GLdouble x, GLdouble y);
+SFPEW_APIENTRY void glWindowPos2f(GLfloat x, GLfloat y);
+SFPEW_APIENTRY void glWindowPos2i(GLint x, GLint y);
+SFPEW_APIENTRY void glWindowPos2s(GLshort x, GLshort y);
+SFPEW_APIENTRY void glWindowPos3d(GLdouble x, GLdouble y, GLdouble z);
+SFPEW_APIENTRY void glWindowPos3f(GLfloat x, GLfloat y, GLfloat z);
+SFPEW_APIENTRY void glWindowPos3i(GLint x, GLint y, GLint z);
+SFPEW_APIENTRY void glWindowPos3s(GLshort x, GLshort y, GLshort z);
+SFPEW_APIENTRY void glWindowPos2dv(const GLdouble* v);
+SFPEW_APIENTRY void glWindowPos2fv(const GLfloat* v);
+SFPEW_APIENTRY void glWindowPos2iv(const GLint* v);
+SFPEW_APIENTRY void glWindowPos2sv(const GLshort* v);
+SFPEW_APIENTRY void glWindowPos3dv(const GLdouble* v);
+SFPEW_APIENTRY void glWindowPos3fv(const GLfloat* v);
+SFPEW_APIENTRY void glWindowPos3iv(const GLint* v);
+SFPEW_APIENTRY void glWindowPos3sv(const GLshort* v);
+
+SFPEW_APIENTRY void glSecondaryColorPointer(GLint size, GLenum type, GLsizei stride, const GLvoid* pointer);
+SFPEW_APIENTRY void glFogCoordPointer(GLenum type, GLsizei stride, const GLvoid* pointer);
+SFPEW_APIENTRY void glFogCoordf(GLfloat coord);
+SFPEW_APIENTRY void glFogCoordd(GLdouble coord);
+SFPEW_APIENTRY void glFogCoordfv(const GLfloat* coord);
+SFPEW_APIENTRY void glFogCoorddv(const GLdouble* coord);
+SFPEW_APIENTRY GLboolean glIsEnabled(GLenum cap);
+SFPEW_APIENTRY void glGetBooleanv(GLenum pname, GLboolean* params);
+SFPEW_APIENTRY void glGetDoublev(GLenum pname, GLdouble* params);
+SFPEW_APIENTRY void glGetLightfv(GLenum light, GLenum pname, GLfloat* params);
+SFPEW_APIENTRY void glGetLightiv(GLenum light, GLenum pname, GLint* params);
+SFPEW_APIENTRY void glGetMaterialfv(GLenum face, GLenum pname, GLfloat* params);
+SFPEW_APIENTRY void glGetMaterialiv(GLenum face, GLenum pname, GLint* params);
+SFPEW_APIENTRY void glGetTexEnvfv(GLenum target, GLenum pname, GLfloat* params);
+SFPEW_APIENTRY void glGetTexEnviv(GLenum target, GLenum pname, GLint* params);
+SFPEW_APIENTRY void glGetTexGenfv(GLenum coord, GLenum pname, GLfloat* params);
+SFPEW_APIENTRY void glGetTexGeniv(GLenum coord, GLenum pname, GLint* params);
+SFPEW_APIENTRY void glGetTexGendv(GLenum coord, GLenum pname, GLdouble* params);
+SFPEW_APIENTRY void glTexImage1D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLint border,
+                                 GLenum format, GLenum type, const GLvoid* pixels);
+SFPEW_APIENTRY void glTexSubImage1D(GLenum target, GLint level, GLint xoffset, GLsizei width, GLenum format,
+                                    GLenum type, const GLvoid* pixels);
+SFPEW_APIENTRY void glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width,
+                                    GLsizei height, GLenum format, GLenum type, const GLvoid* pixels);
 SFPEW_APIENTRY const GLubyte* glGetString(GLenum name);
 SFPEW_APIENTRY const GLubyte* glGetStringi(GLenum name, GLuint index);
 SFPEW_APIENTRY void glGetIntegerv(GLenum pname, GLint* params);
 SFPEW_APIENTRY void glDrawArrays(GLenum mode, GLint first, GLsizei count);
+SFPEW_APIENTRY void glDrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsizei count,
+                                        GLenum type, const GLvoid* indices);
+SFPEW_APIENTRY void glMultiDrawArrays(GLenum mode, const GLint* first, const GLsizei* count,
+                                      GLsizei drawcount);
+SFPEW_APIENTRY void glMultiDrawElements(GLenum mode, const GLsizei* count, GLenum type,
+                                        const GLvoid* const* indices, GLsizei drawcount);
+SFPEW_APIENTRY void glBindBuffer(GLenum target, GLuint buffer);
+SFPEW_APIENTRY void glDeleteBuffers(GLsizei n, const GLuint* buffers);
+SFPEW_APIENTRY void glActiveTexture(GLenum texture);
+SFPEW_APIENTRY void glBindTexture(GLenum target, GLuint texture);
+SFPEW_APIENTRY void glDeleteTextures(GLsizei n, const GLuint* textures);
+SFPEW_APIENTRY void glBindFramebuffer(GLenum target, GLuint framebuffer);
+SFPEW_APIENTRY void glUseProgram(GLuint program);
+SFPEW_APIENTRY void glBlendEquationSeparate(GLenum modeRGB, GLenum modeAlpha);
+SFPEW_APIENTRY void glBlendFuncSeparate(GLenum sfactorRGB, GLenum dfactorRGB, GLenum sfactorAlpha,
+                                       GLenum dfactorAlpha);
 SFPEW_APIENTRY void glGetFloatv(GLenum pname, GLfloat* params);
 SFPEW_APIENTRY void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height,
                                 GLint border, GLenum format, GLenum type, const GLvoid* pixels);
 SFPEW_APIENTRY void glGetTexLevelParameteriv(GLenum target, GLint level, GLenum pname, GLint* params);
 SFPEW_APIENTRY void glGetTexLevelParameterfv(GLenum target, GLint level, GLenum pname, GLfloat* params);
+// The current EGL context for this thread. Exact (and free) once the app has
+// called eglMakeCurrent through the wrapper; otherwise resolved by asking
+// libEGL, which on some loaders costs a syscall per query.
+// Buffer / vertex-attribute surface. Wrapped so the wrapper can observe reads
+// and writes through the bound GL_ARRAY_BUFFER and VAO (plans/12); otherwise
+// eglGetProcAddress hands the app the backend's own pointer and these become
+// invisible.
+SFPEW_APIENTRY void glBufferData(GLenum target, GLsizeiptr size, const void* data, GLenum usage);
+SFPEW_APIENTRY void glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size,
+                                    const void* data);
+SFPEW_APIENTRY void* glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length,
+                                      GLbitfield access);
+SFPEW_APIENTRY GLboolean glUnmapBuffer(GLenum target);
+SFPEW_APIENTRY void glGetBufferParameteriv(GLenum target, GLenum pname, GLint* params);
+SFPEW_APIENTRY void glVertexAttribPointer(GLuint index, GLint size, GLenum type,
+                                          GLboolean normalized, GLsizei stride,
+                                          const void* pointer);
+SFPEW_APIENTRY void glVertexAttribIPointer(GLuint index, GLint size, GLenum type, GLsizei stride,
+                                           const void* pointer);
+SFPEW_APIENTRY void glEnableVertexAttribArray(GLuint index);
+SFPEW_APIENTRY void glDisableVertexAttribArray(GLuint index);
+
+EGLContext sfpewCurrentContext();
+void sfpewNoteCurrentContext(EGLContext context);
+EGLBoolean sfpewEglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLContext ctx);
+EGLBoolean sfpewEglSwapBuffers(EGLDisplay dpy, EGLSurface surface);
+SFPEW_APIENTRY bool sfpewImmediateBatchPendingForTest();
+SFPEW_APIENTRY void sfpewMarkBufferInternalForTest(GLuint buffer);
+SFPEW_APIENTRY bool sfpewBufferIsInternalForTest(GLuint buffer);
+SFPEW_APIENTRY GLuint sfpewLogicalArrayBufferBindingForTest(void);
+EGLBoolean sfpewEglSwapBuffersWithDamageEXT(EGLDisplay dpy, EGLSurface surface, EGLint* rects,
+                                            EGLint n_rects);
+SFPEW_APIENTRY EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read,
+                                        EGLContext ctx);

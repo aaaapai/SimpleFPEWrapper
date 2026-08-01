@@ -7,44 +7,122 @@
 // End of Source File Header
 
 #include "types.h"
+#include <atomic>
+#include <cstring>
 
 #define DEBUG 0
 
-void fixed_function_draw_state_t::reset() {
-    primitive = GL_NONE;
-    vertex_count = 0;
-    vb.str(std::string()); // clearing vb stringstream
+uint64_t sfpewNextSizesEpoch() {
+    // Relaxed is enough: the value only has to be distinct from every other
+    // stamp, and it is always published together with the sizes it describes
+    // through the same (per-context) state the reader already owns.
+    static std::atomic<uint64_t> counter{0};
+    return counter.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
-void fixed_function_draw_state_t::advance() {
-    ++vertex_count;
+void fixed_function_draw_state_t::reset() {
+    primitive = kNoPrimitive;
+    vertex_count = 0;
+    vb.clear();
+    edge_flags.clear();
+    repacked = false;
+}
 
-    const auto& sizes = current_data.sizes;
-
-    // vertex
-    if (sizes.vertex_size > 0) {
-        vb.write((const char*)glm::value_ptr(current_data.vertex), sizeof(GLfloat) * sizes.vertex_size);
+void fixed_function_draw_state_t::repack_for_attribute(int slot, GLint requested) {
+    GLint& stored = current_data.sizes.data[slot];
+    // Repack every collected vertex from the old layout to the new one.
+    // advance() only ever packs slots 0-2 (vertex/normal/color) and 7+
+    // (texcoords), in ascending slot order.
+    const auto packed_size = [&](int s) -> GLint {
+        const GLint sz = current_data.sizes.data[s];
+        return (s <= 2 || s >= 7) && sz > 0 ? sz : 0;
+    };
+    size_t old_stride = 0;
+    for (int s = 0; s < VERTEX_POINTER_COUNT; ++s) old_stride += (size_t)packed_size(s);
+    if (old_stride == 0 || vb.size() < old_stride * vertex_count) {
+        stored = requested;
+        return;
     }
 
-    // normal
-    if (sizes.normal_size > 0) {
-        vb.write((const char*)glm::value_ptr(current_data.normal), sizeof(GLfloat) * sizes.normal_size);
-    }
+    // Backfill value for vertices collected before this attribute existed:
+    // its current value right now (the caller has not overwritten it yet).
+    const GLfloat* previous_value = nullptr;
+    if (slot == 0)
+        previous_value = glm::value_ptr(current_data.vertex);
+    else if (slot == 1)
+        previous_value = glm::value_ptr(current_data.normal);
+    else if (slot == 2)
+        previous_value = glm::value_ptr(current_data.color);
+    else
+        previous_value = glm::value_ptr(current_data.texcoord[slot - 7]);
+    static constexpr GLfloat kComponentDefaults[4] = {0.0f, 0.0f, 0.0f, 1.0f};
 
-    // color
-    if (sizes.color_size > 0) {
-        vb.write((const char*)glm::value_ptr(current_data.color), sizeof(GLfloat) * sizes.color_size);
-    }
-
-    // texcoord
-    for (GLint i = 0; i < MAX_TEX; ++i) {
-        if (sizes.texcoord_size[i] > 0) {
-            vb.write((const char*)glm::value_ptr(current_data.texcoord[i]), sizeof(GLfloat) * sizes.texcoord_size[i]);
+    repacked = true;
+    sfpew_vertex_buffer_t repacked_vb;
+    repacked_vb.reserve((old_stride + (size_t)(requested - stored)) * vertex_count);
+    for (size_t v = 0; v < vertex_count; ++v) {
+        const GLfloat* src = vb.data() + v * old_stride;
+        size_t consumed = 0;
+        for (int s = 0; s < VERTEX_POINTER_COUNT; ++s) {
+            const GLint sz = packed_size(s);
+            if (s == slot) {
+                for (GLint c = 0; c < requested; ++c) {
+                    if (c < sz)
+                        repacked_vb.push_back(src[consumed + c]);
+                    else if (sz == 0)
+                        repacked_vb.push_back(previous_value[c]);
+                    else
+                        repacked_vb.push_back(kComponentDefaults[c]);
+                }
+            } else {
+                for (GLint c = 0; c < sz; ++c) repacked_vb.push_back(src[consumed + c]);
+            }
+            consumed += (size_t)sz;
         }
     }
-
-    // LOG_D("advance(): vertexcount = %d, vbsize = %d", vertex_count, vb.str().size())
+    vb = std::move(repacked_vb);
+    stored = requested;
+    current_data.sizes_epoch = sfpewNextSizesEpoch();
 }
+
+void fixed_function_draw_state_t::rebuild_packed_layout() {
+    packed_span_count = 0;
+    packed_floats = 0;
+    const auto* base = reinterpret_cast<const GLfloat*>(&current_data);
+    const auto add = [&](const GLfloat* src, GLint count) {
+        if (count <= 0) return;
+        const auto offset = static_cast<uint16_t>(src - base);
+        // Merge with the previous span when the source is contiguous; the
+        // destination always is.
+        if (packed_span_count > 0) {
+            auto& last = packed_spans[packed_span_count - 1];
+            if (last.src_offset + last.count == offset) {
+                last.count = static_cast<uint16_t>(last.count + count);
+                packed_floats += static_cast<size_t>(count);
+                return;
+            }
+        }
+        packed_spans[packed_span_count++] = {offset, static_cast<uint16_t>(count)};
+        packed_floats += static_cast<size_t>(count);
+    };
+
+    const auto& sizes = current_data.sizes;
+    add(glm::value_ptr(current_data.vertex), sizes.vertex_size);
+    add(glm::value_ptr(current_data.normal), sizes.normal_size);
+    add(glm::value_ptr(current_data.color), sizes.color_size);
+    // Slots 5 and 6. compile_vertexattrib() sizes EVERY slot it sees, so a
+    // slot that is sized but never packed here shifts every later attribute
+    // (fog coord and secondary color both land before the texcoords).
+    add(&current_data.fog_coord, sizes.fog_size > 0 ? 1 : 0);
+    add(glm::value_ptr(current_data.secondary_color), sizes.secondary_color_size);
+    for (GLint i = 0; i < MAX_TEX; ++i) {
+        add(glm::value_ptr(current_data.texcoord[i]), sizes.texcoord_size[i]);
+    }
+    packed_layout_sizes = sizes;
+    packed_layout_epoch = current_data.sizes_epoch;
+}
+
+
 
 void fixed_function_draw_state_t::compile_vertexattrib(vertex_pointer_array_t& va) const {
     va.reset();
@@ -53,7 +131,7 @@ void fixed_function_draw_state_t::compile_vertexattrib(vertex_pointer_array_t& v
     va.buffer_based = false;
 
     const auto& sizes = current_data.sizes;
-    GLsizei offset = 0;
+    uintptr_t offset = 0;
 
     // vertex
     if (sizes.vertex_size > 0) {
@@ -102,6 +180,34 @@ void fixed_function_draw_state_t::compile_vertexattrib(vertex_pointer_array_t& v
         offset += sizes.color_size * sizeof(GLfloat);
     }
 
+    // fog coord (slot 5) - declaration order must match advance()'s packing
+    if (sizes.fog_size > 0) {
+        va.enabled_pointers |= vp_mask(GL_FOG_COORD_ARRAY);
+        va.attributes[vp2idx(GL_FOG_COORD_ARRAY)] = {
+            .size = 1,
+            .usage = GL_FOG_COORD_ARRAY,
+            .type = GL_FLOAT,
+            .normalized = GL_FALSE,
+            .stride = 0,
+            .pointer = (const void*)offset,
+        };
+        offset += sizeof(GLfloat);
+    }
+
+    // secondary color (slot 6)
+    if (sizes.secondary_color_size > 0) {
+        va.enabled_pointers |= vp_mask(GL_SECONDARY_COLOR_ARRAY);
+        va.attributes[vp2idx(GL_SECONDARY_COLOR_ARRAY)] = {
+            .size = sizes.secondary_color_size,
+            .usage = GL_SECONDARY_COLOR_ARRAY,
+            .type = GL_FLOAT,
+            .normalized = GL_FALSE,
+            .stride = 0,
+            .pointer = (const void*)offset,
+        };
+        offset += sizes.secondary_color_size * sizeof(GLfloat);
+    }
+
     // texcoord
     for (GLint i = 0; i < MAX_TEX; ++i) {
         if (sizes.texcoord_size[i] > 0) {
@@ -120,5 +226,5 @@ void fixed_function_draw_state_t::compile_vertexattrib(vertex_pointer_array_t& v
         }
     }
 
-    va.stride = offset;
+    va.stride = (GLsizei)offset;
 }

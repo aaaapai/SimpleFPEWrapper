@@ -13,89 +13,142 @@
 
 #include <array>
 
-// a bit bad for perf, but keep this for now...
+void flushPendingImmediateDraws();
+
+// Puts the app's program/VAO/buffers back if a fixed-function draw left the
+// wrapper's own bound (plans/12). One branch when nothing is held.
+void sfpewFlushDeferredDrawState();
+
+// What every exported entry point OUTSIDE the immediate-mode vertex family
+// calls first: drains the pending glyph batch and hands the app its draw state
+// back. Only glBegin/glEnd and the glVertex/glColor/glNormal/glTexCoord/
+// glMultiTexCoord/glFogCoord/glSecondaryColor/glEdgeFlag/glArrayElement
+// families use the bare flushPendingImmediateDraws(), because keeping the
+// wrapper's bindings across those is the entire point.
+//
+// Erring toward calling this is safe: an unnecessary call costs the restore
+// it was going to pay anyway. Omitting one where the app can observe those
+// bindings is what corrupts state, so new entry points should use this unless
+// they are demonstrably part of the vertex family.
+inline void sfpewEntryBarrier() {
+    flushPendingImmediateDraws();
+    sfpewFlushDeferredDrawState();
+}
+
+// For entry points that CANNOT observe the program, VAO or buffer bindings -
+// texture state being the case that matters in practice. The pending batch
+// still has to drain, because it was collected under the state this call is
+// about to change; but handing the app back bindings it cannot look at only
+// forces the next fixed-function draw to re-establish ours. A texture switch
+// between draws paid a full save/restore cycle for nothing (plans/12).
+//
+// The bar for using this instead of sfpewEntryBarrier is high: the entry must
+// neither read nor write GL_CURRENT_PROGRAM, GL_VERTEX_ARRAY_BINDING,
+// GL_ARRAY_BUFFER_BINDING or GL_ELEMENT_ARRAY_BUFFER_BINDING, and must not
+// hand control to anything that could. When in doubt use the full barrier: the
+// cost of an unnecessary restore is speed, the cost of a missing one is the app
+// drawing with the wrapper's state.
+inline void sfpewTextureStateBarrier() { flushPendingImmediateDraws(); }
+
+// Same flush-only contract for entries that mutate only the wrapper's own
+// CPU-side state: the matrix-stack family (glMatrixMode, glPush/PopMatrix,
+// glTranslate/Rotate/Scale, glLoad/MultMatrix, glOrtho, glFrustum and their
+// display-list replay commands) and the client-array family (gl*Pointer,
+// glEnable/DisableClientState, glClientActiveTexture). Both meet the bar
+// above: no read or write of the program, VAO or buffer bindings, and no
+// control handed elsewhere. Using the full barrier here made every draw that
+// sits between glPushMatrix/glPopMatrix or a pointer respecification (the
+// Minecraft chunk and entity shapes) pay a glUseProgram(0) ->
+// glUseProgram(fpe) round trip per draw.
+inline void sfpewClientStateBarrier() { flushPendingImmediateDraws(); }
+
+// Stream-upload into the persistent-coherent immediate ring (GL_ARRAY_BUFFER
+// must already be bound to fpe_immediate_vbo). Returns the byte offset of the
+// uploaded range inside the ring (0 on the glBufferData fallback). Shared by
+// the glBegin/glEnd path and the client-array draw commit.
+GLintptr sfpewUploadImmediateVertexData(const void* data, size_t size);
+
+// Same ring mechanism for CPU-side index data (client-memory indices and
+// rewritten GL_QUADS). GL_ELEMENT_ARRAY_BUFFER must already be bound to
+// fpe_element_ring. Returns the byte offset to pass to glDrawElements.
+GLintptr sfpewUploadElementData(const void* data, size_t size);
+
+// Missing components take their GL defaults (0, 0, 0, 1) in the SAME store as
+// the supplied ones. Writing the default vector first and then overwriting it
+// costs a second 16-byte store per attribute on the hottest path there is -
+// three of these run for every immediate-mode vertex.
+template <GLint N, typename Type>
+inline glm::vec4 mglDefaultedVec4(const std::array<Type, N>& v) {
+    if constexpr (N >= 4)
+        return glm::vec4((GLfloat)v[0], (GLfloat)v[1], (GLfloat)v[2], (GLfloat)v[3]);
+    else if constexpr (N == 3)
+        return glm::vec4((GLfloat)v[0], (GLfloat)v[1], (GLfloat)v[2], 1.0f);
+    else if constexpr (N == 2)
+        return glm::vec4((GLfloat)v[0], (GLfloat)v[1], 0.0f, 1.0f);
+    else
+        return glm::vec4((GLfloat)v[0], 0.0f, 0.0f, 1.0f);
+}
+
+// Vertex-data entries ride the Begin/End context pin: zero strict resolves
+// while a batch is collecting, one strict resolve otherwise (types.h).
 template <typename Type, GLint N>
 void mglNormal(std::array<Type, N> normal) {
-    auto& state = g_glstate.fpe_state.fpe_draw;
+    auto& state = sfpewVertexDataState().fpe_state.fpe_draw;
+    state.set_attribute_size(1, N); // before overwriting the current value
     auto& cur = state.current_data.normal;
     // let's hope this vectorizes well...
     for (auto i = 0; i < N; ++i) {
         glm::value_ptr(cur)[i] = (GLfloat)normal[i];
     }
-    state.current_data.sizes.normal_size = N;
+}
+
+// glFogCoord* feeds attribute slot 5. It only reaches the shader when
+// glFogi(GL_FOG_COORD_SRC, GL_FOG_COORD) selects it as the fog distance.
+template <typename Type>
+void mglFogCoord(Type coord) {
+    auto& state = g_glstate.fpe_state.fpe_draw;
+    state.set_attribute_size(5, 1);
+    state.current_data.fog_coord = (GLfloat)coord;
 }
 
 template <typename Type, GLint N>
 void mglTexCoord(std::array<Type, N> uv, GLint texid) {
-    auto& state = g_glstate.fpe_state.fpe_draw;
-    auto& cur = state.current_data.texcoord[texid];
-    cur = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
-    // let's hope this vectorizes well...
-    for (auto i = 0; i < N; ++i) {
-        glm::value_ptr(cur)[i] = (GLfloat)uv[i];
-    }
-    state.current_data.sizes.texcoord_size[texid] = N;
+    auto& state = sfpewVertexDataState().fpe_state.fpe_draw;
+    state.set_attribute_size(7 + texid, N);
+    state.current_data.texcoord[texid] = mglDefaultedVec4<N>(uv);
 }
 
-template <typename Type, GLint N>
-void mglColor(std::array<Type, N> color) {
-    auto& state = g_glstate.fpe_state.fpe_draw;
-    auto& cur = state.current_data.color;
-    // Desktop GL defines alpha=1 for every glColor3* entry point.
-    cur = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
-    // let's hope this vectorizes well...
-    for (auto i = 0; i < N; ++i) {
-        glm::value_ptr(cur)[i] = (GLfloat)color[i];
-    }
-    state.current_data.sizes.color_size = N;
+// Colour material is a per-vertex side effect that mutates uniform material
+// state, so it has to stay ordered with the batch - but it is off for almost
+// every draw. Kept out of line so glColor4f can inline the part that always
+// runs: with the whole thing in one function the compiler declined to inline
+// it, and every immediate-mode vertex paid a call.
+void sfpewApplyColorMaterial(glstate_t& gs, const glm::vec4& colour);
 
-    if (g_glstate.fpe_state.fpe_bools.color_material_enable) {
-        const auto apply = [&](material_t& material) {
-            switch (g_glstate.fpe_state.color_material_mode) {
-            case GL_AMBIENT:
-                material.ambient = cur;
-                break;
-            case GL_DIFFUSE:
-                material.diffuse = cur;
-                break;
-            case GL_SPECULAR:
-                material.specular = cur;
-                break;
-            case GL_EMISSION:
-                material.emission = cur;
-                break;
-            case GL_AMBIENT_AND_DIFFUSE:
-                material.ambient = cur;
-                material.diffuse = cur;
-                break;
-            default:
-                break;
-            }
-        };
-        if (g_glstate.fpe_state.color_material_face == GL_FRONT ||
-            g_glstate.fpe_state.color_material_face == GL_FRONT_AND_BACK)
-            apply(g_glstate.fpe_uniform.materials[0]);
-        if (g_glstate.fpe_state.color_material_face == GL_BACK ||
-            g_glstate.fpe_state.color_material_face == GL_FRONT_AND_BACK)
-            apply(g_glstate.fpe_uniform.materials[1]);
-    }
+template <typename Type, GLint N>
+__attribute__((always_inline)) inline void mglColor(std::array<Type, N> color) {
+    auto& gs = sfpewVertexDataState();
+    auto& state = gs.fpe_state.fpe_draw;
+    state.set_attribute_size(2, N);
+    // Desktop GL defines alpha=1 for every glColor3* entry point.
+    auto& cur = state.current_data.color;
+    cur = mglDefaultedVec4<N>(color);
+    if (__builtin_expect(gs.fpe_state.fpe_bools.color_material_enable, 0))
+        sfpewApplyColorMaterial(gs, cur);
 }
 
 template <typename Type, GLint N>
 void mglVertex(std::array<Type, N> vertex) {
-    assert(g_glstate.fpe_state.fpe_draw.primitive != GL_NONE);
-
-    auto& state = g_glstate.fpe_state.fpe_draw;
+    auto& state = sfpewVertexDataState().fpe_state.fpe_draw;
+    // Release builds define NDEBUG, so this must be a real check: a glVertex*
+    // outside glBegin/glEnd would otherwise append stray data that leaks into
+    // the next primitive's vertex stream.
+    if (state.primitive == kNoPrimitive) return;
+    state.set_attribute_size(0, N);
     auto& cur = state.current_data.vertex;
     // Missing components are (0, 0, 0, 1), rather than values left over
     // from the previous immediate-mode vertex.
-    cur = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
-    // let's hope this vectorizes well...
-    for (auto i = 0; i < N; ++i) {
-        glm::value_ptr(cur)[i] = (GLfloat)vertex[i];
-    }
-    state.current_data.sizes.vertex_size = N;
-
+    cur = mglDefaultedVec4<N>(vertex);
     // let's collect one vertex here!
     state.advance();
 }

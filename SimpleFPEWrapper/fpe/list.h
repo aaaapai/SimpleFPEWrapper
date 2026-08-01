@@ -9,6 +9,12 @@
 #pragma once
 
 #include <GL/gl.h>
+#include "../log.h"
+#include <glm/mat4x4.hpp>
+#include <glm/vec3.hpp>
+#include <array>
+#include <cstddef>
+#include <cstdint>
 #include <unordered_map>
 
 #include <vector>
@@ -27,22 +33,238 @@ using unordered_map = std::unordered_map<K, V>;
 
 class GLCmd {
 public:
+    // Classification for the glEndList immediate-run compiler
+    // (sfpewCompileImmediateRuns in drawing1x.cpp).
+    enum class immediate_class_t : uint8_t { none, begin, end, vertex_data };
+
     virtual ~GLCmd() = default;
     GLCmd() = default;
     GLCmd(GLCmd&&) = default;
     GLCmd& operator=(GLCmd&&) = default;
     virtual void execute() const = 0;
+    virtual bool tryMerge(const GLCmd&) { return false; }
+    virtual bool isCapturedDraw() const { return false; }
+    virtual bool bakePositionTranslation(const glm::vec3&) { return false; }
+    virtual const GLCmd* capturedDrawForBatch(glm::mat4*) const { return nullptr; }
+    virtual immediate_class_t immediateClass() const { return immediate_class_t::none; }
+    virtual GLenum immediateBeginMode() const { return GL_NONE; }
 
     GLCmd(const GLCmd&) = delete;
     GLCmd& operator=(const GLCmd&) = delete;
 };
 using DisplayList = std::vector<std::unique_ptr<GLCmd>>;
 
+void optimizeDisplayListCommands(DisplayList& commands);
+void sfpewCompileImmediateRuns(DisplayList& commands);
+
+// ---- Immediate-run classification (compile-time, by recorded function) ----
+// One overload per recorded signature; pointer equality picks the immediate
+// family out of same-signature state entries. The variadic fallback returns
+// none for everything else.
+namespace sfpew_imm {
+using ic = GLCmd::immediate_class_t;
+constexpr ic classify(void (*f)(GLenum)) { return f == &glBegin ? ic::begin : ic::none; }
+constexpr ic classify(void (*f)()) { return f == &glEnd ? ic::end : ic::none; }
+// float scalar
+constexpr ic classify(void (*f)(GLfloat)) { return f == &glTexCoord1f ? ic::vertex_data : ic::none; }
+constexpr ic classify(void (*f)(GLfloat, GLfloat)) {
+    return f == &glVertex2f || f == &glTexCoord2f ? ic::vertex_data : ic::none;
+}
+constexpr ic classify(void (*f)(GLfloat, GLfloat, GLfloat)) {
+    return f == &glVertex3f || f == &glColor3f || f == &glNormal3f || f == &glTexCoord3f
+               ? ic::vertex_data
+               : ic::none;
+}
+constexpr ic classify(void (*f)(GLfloat, GLfloat, GLfloat, GLfloat)) {
+    return f == &glVertex4f || f == &glColor4f || f == &glTexCoord4f ? ic::vertex_data : ic::none;
+}
+// double scalar
+constexpr ic classify(void (*f)(GLdouble)) { return f == &glTexCoord1d ? ic::vertex_data : ic::none; }
+constexpr ic classify(void (*f)(GLdouble, GLdouble)) {
+    return f == &glVertex2d || f == &glTexCoord2d ? ic::vertex_data : ic::none;
+}
+constexpr ic classify(void (*f)(GLdouble, GLdouble, GLdouble)) {
+    return f == &glVertex3d || f == &glColor3d || f == &glNormal3d || f == &glTexCoord3d
+               ? ic::vertex_data
+               : ic::none;
+}
+constexpr ic classify(void (*f)(GLdouble, GLdouble, GLdouble, GLdouble)) {
+    return f == &glVertex4d || f == &glColor4d || f == &glTexCoord4d ? ic::vertex_data : ic::none;
+}
+// int / short / byte scalar
+constexpr ic classify(void (*f)(GLint)) { return f == &glTexCoord1i ? ic::vertex_data : ic::none; }
+constexpr ic classify(void (*f)(GLint, GLint)) {
+    return f == &glVertex2i || f == &glTexCoord2i ? ic::vertex_data : ic::none;
+}
+constexpr ic classify(void (*f)(GLint, GLint, GLint)) {
+    return f == &glVertex3i || f == &glColor3i || f == &glNormal3i || f == &glTexCoord3i
+               ? ic::vertex_data
+               : ic::none;
+}
+constexpr ic classify(void (*f)(GLint, GLint, GLint, GLint)) {
+    return f == &glVertex4i || f == &glColor4i || f == &glTexCoord4i ? ic::vertex_data : ic::none;
+}
+constexpr ic classify(void (*f)(GLshort)) { return f == &glTexCoord1s ? ic::vertex_data : ic::none; }
+constexpr ic classify(void (*f)(GLshort, GLshort)) {
+    return f == &glVertex2s || f == &glTexCoord2s ? ic::vertex_data : ic::none;
+}
+constexpr ic classify(void (*f)(GLshort, GLshort, GLshort)) {
+    return f == &glVertex3s || f == &glColor3s || f == &glNormal3s || f == &glTexCoord3s
+               ? ic::vertex_data
+               : ic::none;
+}
+constexpr ic classify(void (*f)(GLshort, GLshort, GLshort, GLshort)) {
+    return f == &glVertex4s || f == &glColor4s || f == &glTexCoord4s ? ic::vertex_data : ic::none;
+}
+constexpr ic classify(void (*f)(GLbyte, GLbyte, GLbyte)) {
+    return f == &glColor3b || f == &glNormal3b ? ic::vertex_data : ic::none;
+}
+constexpr ic classify(void (*f)(GLbyte, GLbyte, GLbyte, GLbyte)) {
+    return f == &glColor4b ? ic::vertex_data : ic::none;
+}
+constexpr ic classify(void (*f)(GLubyte, GLubyte, GLubyte)) {
+    return f == &glColor3ub ? ic::vertex_data : ic::none;
+}
+constexpr ic classify(void (*f)(GLubyte, GLubyte, GLubyte, GLubyte)) {
+    return f == &glColor4ub ? ic::vertex_data : ic::none;
+}
+constexpr ic classify(void (*f)(GLuint, GLuint, GLuint)) {
+    return f == &glColor3ui ? ic::vertex_data : ic::none;
+}
+constexpr ic classify(void (*f)(GLuint, GLuint, GLuint, GLuint)) {
+    return f == &glColor4ui ? ic::vertex_data : ic::none;
+}
+constexpr ic classify(void (*f)(GLushort, GLushort, GLushort)) {
+    return f == &glColor3us ? ic::vertex_data : ic::none;
+}
+constexpr ic classify(void (*f)(GLushort, GLushort, GLushort, GLushort)) {
+    return f == &glColor4us ? ic::vertex_data : ic::none;
+}
+// pointer variants
+constexpr ic classify(void (*f)(const GLfloat*)) {
+    return f == &glVertex2fv || f == &glVertex3fv || f == &glVertex4fv || f == &glColor3fv ||
+                   f == &glColor4fv || f == &glNormal3fv || f == &glTexCoord1fv ||
+                   f == &glTexCoord2fv || f == &glTexCoord3fv || f == &glTexCoord4fv
+               ? ic::vertex_data
+               : ic::none;
+}
+constexpr ic classify(void (*f)(const GLdouble*)) {
+    return f == &glVertex2dv || f == &glVertex3dv || f == &glVertex4dv || f == &glColor3dv ||
+                   f == &glColor4dv || f == &glNormal3dv || f == &glTexCoord1dv ||
+                   f == &glTexCoord2dv || f == &glTexCoord3dv || f == &glTexCoord4dv
+               ? ic::vertex_data
+               : ic::none;
+}
+constexpr ic classify(void (*f)(const GLint*)) {
+    return f == &glVertex2iv || f == &glVertex3iv || f == &glVertex4iv || f == &glColor3iv ||
+                   f == &glColor4iv || f == &glNormal3iv || f == &glTexCoord1iv ||
+                   f == &glTexCoord2iv || f == &glTexCoord3iv || f == &glTexCoord4iv
+               ? ic::vertex_data
+               : ic::none;
+}
+constexpr ic classify(void (*f)(const GLshort*)) {
+    return f == &glVertex2sv || f == &glVertex3sv || f == &glVertex4sv || f == &glColor3sv ||
+                   f == &glColor4sv || f == &glNormal3sv || f == &glTexCoord1sv ||
+                   f == &glTexCoord2sv || f == &glTexCoord3sv || f == &glTexCoord4sv
+               ? ic::vertex_data
+               : ic::none;
+}
+constexpr ic classify(void (*f)(const GLbyte*)) {
+    return f == &glColor3bv || f == &glColor4bv || f == &glNormal3bv ? ic::vertex_data : ic::none;
+}
+constexpr ic classify(void (*f)(const GLubyte*)) {
+    return f == &glColor3ubv || f == &glColor4ubv ? ic::vertex_data : ic::none;
+}
+constexpr ic classify(void (*f)(const GLuint*)) {
+    return f == &glColor3uiv || f == &glColor4uiv ? ic::vertex_data : ic::none;
+}
+constexpr ic classify(void (*f)(const GLushort*)) {
+    return f == &glColor3usv || f == &glColor4usv ? ic::vertex_data : ic::none;
+}
+// multitexcoord scalar + pointer
+constexpr ic classify(void (*f)(GLenum, GLfloat)) {
+    return f == &glMultiTexCoord1f ? ic::vertex_data : ic::none;
+}
+constexpr ic classify(void (*f)(GLenum, GLfloat, GLfloat)) {
+    return f == &glMultiTexCoord2f ? ic::vertex_data : ic::none;
+}
+constexpr ic classify(void (*f)(GLenum, GLfloat, GLfloat, GLfloat)) {
+    return f == &glMultiTexCoord3f ? ic::vertex_data : ic::none;
+}
+constexpr ic classify(void (*f)(GLenum, GLfloat, GLfloat, GLfloat, GLfloat)) {
+    return f == &glMultiTexCoord4f ? ic::vertex_data : ic::none;
+}
+constexpr ic classify(void (*f)(GLenum, GLdouble)) {
+    return f == &glMultiTexCoord1d ? ic::vertex_data : ic::none;
+}
+constexpr ic classify(void (*f)(GLenum, GLdouble, GLdouble)) {
+    return f == &glMultiTexCoord2d ? ic::vertex_data : ic::none;
+}
+constexpr ic classify(void (*f)(GLenum, GLdouble, GLdouble, GLdouble)) {
+    return f == &glMultiTexCoord3d ? ic::vertex_data : ic::none;
+}
+constexpr ic classify(void (*f)(GLenum, GLdouble, GLdouble, GLdouble, GLdouble)) {
+    return f == &glMultiTexCoord4d ? ic::vertex_data : ic::none;
+}
+constexpr ic classify(void (*f)(GLenum, GLint)) {
+    return f == &glMultiTexCoord1i ? ic::vertex_data : ic::none;
+}
+constexpr ic classify(void (*f)(GLenum, GLint, GLint)) {
+    return f == &glMultiTexCoord2i ? ic::vertex_data : ic::none;
+}
+constexpr ic classify(void (*f)(GLenum, GLint, GLint, GLint)) {
+    return f == &glMultiTexCoord3i ? ic::vertex_data : ic::none;
+}
+constexpr ic classify(void (*f)(GLenum, GLint, GLint, GLint, GLint)) {
+    return f == &glMultiTexCoord4i ? ic::vertex_data : ic::none;
+}
+constexpr ic classify(void (*f)(GLenum, GLshort)) {
+    return f == &glMultiTexCoord1s ? ic::vertex_data : ic::none;
+}
+constexpr ic classify(void (*f)(GLenum, GLshort, GLshort)) {
+    return f == &glMultiTexCoord2s ? ic::vertex_data : ic::none;
+}
+constexpr ic classify(void (*f)(GLenum, GLshort, GLshort, GLshort)) {
+    return f == &glMultiTexCoord3s ? ic::vertex_data : ic::none;
+}
+constexpr ic classify(void (*f)(GLenum, GLshort, GLshort, GLshort, GLshort)) {
+    return f == &glMultiTexCoord4s ? ic::vertex_data : ic::none;
+}
+constexpr ic classify(void (*f)(GLenum, const GLfloat*)) {
+    return f == &glMultiTexCoord1fv || f == &glMultiTexCoord2fv || f == &glMultiTexCoord3fv ||
+                   f == &glMultiTexCoord4fv
+               ? ic::vertex_data
+               : ic::none;
+}
+constexpr ic classify(void (*f)(GLenum, const GLdouble*)) {
+    return f == &glMultiTexCoord1dv || f == &glMultiTexCoord2dv || f == &glMultiTexCoord3dv ||
+                   f == &glMultiTexCoord4dv
+               ? ic::vertex_data
+               : ic::none;
+}
+constexpr ic classify(void (*f)(GLenum, const GLint*)) {
+    return f == &glMultiTexCoord1iv || f == &glMultiTexCoord2iv || f == &glMultiTexCoord3iv ||
+                   f == &glMultiTexCoord4iv
+               ? ic::vertex_data
+               : ic::none;
+}
+constexpr ic classify(void (*f)(GLenum, const GLshort*)) {
+    return f == &glMultiTexCoord1sv || f == &glMultiTexCoord2sv || f == &glMultiTexCoord3sv ||
+                   f == &glMultiTexCoord4sv
+               ? ic::vertex_data
+               : ic::none;
+}
+// everything else records as none
+template <typename F> constexpr ic classify(F) { return ic::none; }
+} // namespace sfpew_imm
+
 template <auto FuncPtr, typename... Args>
 class GLFuncCmd : public GLCmd {
     using StoredArgs = std::tuple<std::decay_t<Args>...>;
     StoredArgs args;
     std::vector<std::vector<uint8_t>> argBuffers;
+
+    static constexpr immediate_class_t kImmediateClass = sfpew_imm::classify(FuncPtr);
 
 public:
     explicit GLFuncCmd(Args&&... processedArgs, std::vector<std::vector<uint8_t>>&& buffers)
@@ -51,56 +273,99 @@ public:
     void execute() const override {
         std::apply([](auto&&... args) { FuncPtr(std::forward<decltype(args)>(args)...); }, args);
     }
+
+    immediate_class_t immediateClass() const override { return kImmediateClass; }
+
+    GLenum immediateBeginMode() const override {
+        if constexpr (kImmediateClass == immediate_class_t::begin && sizeof...(Args) >= 1) {
+            return static_cast<GLenum>(std::get<0>(args));
+        } else {
+            return GL_NONE;
+        }
+    }
 };
 
 class DisplayListManager {
     inline static GLuint nextListId = 1;
     inline static GLenum listMode = GL_COMPILE;
-    inline static GLboolean calling = GL_FALSE;
+    inline static GLuint callingDepth = 0;
+    inline static uint64_t mutationGeneration = 1;
 
-    inline static unordered_map<GLuint, DisplayList> lists;
+    // Deliberately immortal (allocated, never freed). A process normally
+    // exits with its GL context still current and its display lists still
+    // recorded; destroying the registry then would run every captured
+    // command's destructor, and those call GL - glDeleteBuffers, and a
+    // fence in the vertex arena - at a point where exit-time teardown has
+    // already invalidated the driver's dispatch, which segfaults. Freeing
+    // GPU objects on the way out buys nothing, because the driver reclaims
+    // all of them when the process dies. Runtime destruction (glDeleteLists,
+    // re-recording a list) is unaffected and still releases properly.
+    inline static unordered_map<GLuint, DisplayList>& lists =
+        *new unordered_map<GLuint, DisplayList>();
     inline static GLuint currentListID = 0;
 
     template <auto Func, typename... ProcessedArgs>
     void recordImpl(std::vector<std::vector<uint8_t>>&& buffers, ProcessedArgs&&... args) {
+        bumpMutationGeneration();
         lists[currentListID].emplace_back(std::make_unique<GLFuncCmd<Func, ProcessedArgs...>>(
             std::forward<ProcessedArgs>(args)..., std::move(buffers)));
     }
 
+    static void bumpMutationGeneration() {
+        ++mutationGeneration;
+        // Zero is reserved for an uninitialised consumer cache. Unsigned
+        // wraparound is defined, so skip it if this process lives long enough
+        // to rebuild 2^64 display-list commands.
+        if (mutationGeneration == 0) ++mutationGeneration;
+    }
+
 public:
     static GLuint genDisplayList(GLsizei range) {
+        // glGenLists: zero or negative ranges allocate nothing and return 0.
+        if (range <= 0) return 0;
         GLuint first = nextListId;
         nextListId += range;
-        for (GLuint i = first; i < first + range; ++i) {
-            lists[i] = std::vector<std::unique_ptr<GLCmd>>{};
+        for (GLsizei i = 0; i < range; ++i) {
+            lists[first + i] = std::vector<std::unique_ptr<GLCmd>>{};
         }
+        bumpMutationGeneration();
         return first;
     }
 
     static void deleteDisplayList(GLuint list, GLsizei range) {
-        for (GLuint i = 0; i < range; ++i) {
+        // A negative range previously wrapped to ~2^32 iterations here.
+        if (range <= 0) return;
+        for (GLsizei i = 0; i < range; ++i) {
             lists.erase(list + i);
         }
+        bumpMutationGeneration();
     }
 
     static GLboolean isDisplayList(GLuint list) { return lists.find(list) != lists.end() ? GL_TRUE : GL_FALSE; }
 
     static void startRecord(GLuint listID, GLenum mode) {
+        bumpMutationGeneration();
         currentListID = listID;
         listMode = mode;
         lists.try_emplace(listID).first->second.clear();
     }
 
     static void endRecord() {
+        auto it = lists.find(currentListID);
+        if (it != lists.end()) {
+            sfpewCompileImmediateRuns(it->second);
+            optimizeDisplayListCommands(it->second);
+        }
+        bumpMutationGeneration();
         currentListID = 0;
         listMode = GL_COMPILE;
     }
 
     static int isRecording() { return currentListID != 0 ? 1 : 0; }
 
-    static int isCalling() { return calling; }
+    static int isCalling() { return callingDepth != 0; }
 
-    static int shouldRecord() { return !calling && currentListID != 0; }
+    static int shouldRecord() { return callingDepth == 0 && currentListID != 0; }
 
     static int shouldFinish() { return (currentListID != 0 && listMode == GL_COMPILE) ? 1 : 0; }
 
@@ -140,24 +405,91 @@ public:
     }
 
     void recordCommand(std::unique_ptr<GLCmd> command) {
-        if (command != nullptr) lists[currentListID].emplace_back(std::move(command));
+        if (command == nullptr) return;
+        bumpMutationGeneration();
+        auto& commands = lists[currentListID];
+        // A command may fold an immediately adjacent command only when it can
+        // prove that doing so preserves the display-list state boundary.
+        if (!commands.empty() && commands.back()->tryMerge(*command)) return;
+        commands.emplace_back(std::move(command));
     }
+
+    // GL 2.1 guarantees at least 64 nesting levels; recorded glCallList
+    // commands re-enter callList, so an unbounded (or self-referential)
+    // chain would otherwise overflow the native stack.
+    static constexpr GLuint kMaxListNesting = 64;
 
     static void callList(GLuint listID) {
         auto it = lists.find(listID);
         if (it == lists.end()) return;
 
-        calling = GL_TRUE;
+        if (callingDepth >= kMaxListNesting) {
+            SFPEW_LOGW("glCallList(%u): list nesting exceeds %u levels; call skipped", listID,
+                       kMaxListNesting);
+            return;
+        }
+
+        ++callingDepth;
         for (auto& cmd : it->second) {
             cmd->execute();
         }
-        calling = GL_FALSE;
+        --callingDepth;
     }
+
+    static bool callSingleCaptured(GLuint listID) {
+        if (callingDepth != 0) return false;
+
+        struct cache_entry_t {
+            uint64_t generation = 0;
+            GLuint listID = 0;
+            const GLCmd* command = nullptr;
+        };
+        constexpr size_t kCacheSize = 256;
+        // Heap-backed rather than a thread_local array: the module's whole TLS
+        // block has to fit glibc's static-TLS surplus for tls_model
+        // initial-exec to be usable, and this cache alone was 6144 of the 9216
+        // bytes. One pointer load and a null check replace what would otherwise
+        // be a __tls_get_addr call per access (plans/12).
+        using cache_t = std::array<cache_entry_t, kCacheSize>;
+        thread_local std::unique_ptr<cache_t> cacheStorage;
+        if (cacheStorage == nullptr) cacheStorage = std::make_unique<cache_t>();
+        cache_t& cache = *cacheStorage;
+
+        const uint64_t currentGeneration = mutationGeneration;
+        auto& entry = cache[(static_cast<size_t>(listID) * 2654435761u) & (kCacheSize - 1u)];
+        const GLCmd* command = nullptr;
+        if (entry.generation == currentGeneration && entry.listID == listID) {
+            command = entry.command;
+        } else {
+            const auto it = lists.find(listID);
+            if (it == lists.end() || it->second.size() != 1) return false;
+            command = it->second.front().get();
+            if (command == nullptr || !command->isCapturedDraw()) return false;
+            entry = {currentGeneration, listID, command};
+        }
+
+        ++callingDepth;
+        command->execute();
+        --callingDepth;
+        return true;
+    }
+
+    static const DisplayList* findList(GLuint listID) {
+        const auto it = lists.find(listID);
+        return it == lists.end() ? nullptr : &it->second;
+    }
+
+    static uint64_t generation() { return mutationGeneration; }
+    static GLuint currentList() { return currentListID; }
+    static GLuint listBase(); // defined in list.cpp next to the storage
+    static GLenum currentListMode() { return listMode; }
 };
 
 inline DisplayListManager displayListManager;
 
 inline GLboolean disableRecording = GL_FALSE;
+
+bool tryExecuteCapturedDisplayLists(const GLuint* listIds, size_t listCount);
 
 #define SELF_CALL(func, ...)                                                                                           \
     {                                                                                                                  \

@@ -9,14 +9,43 @@
 #include "list.h"
 #include "pointer_utils.h"
 #include "fpe.hpp"
+#include "drawing1x.h"
 
 #define DEBUG 0
 
 GLuint currentListBase = 0;
 
+namespace {
+
+template <typename T>
+void decodeNativeListIds(GLsizei n, const GLvoid* lists, std::vector<GLuint>& output) {
+    const auto* values = static_cast<const T*>(lists);
+    for (GLsizei i = 0; i < n; ++i)
+        output[static_cast<size_t>(i)] = currentListBase + static_cast<GLuint>(values[i]);
+}
+
+void decodePackedListIds(GLsizei n, size_t width, const GLvoid* lists,
+                         std::vector<GLuint>& output) {
+    const auto* bytes = static_cast<const GLubyte*>(lists);
+    for (GLsizei i = 0; i < n; ++i) {
+        GLuint offset = 0;
+        for (size_t component = 0; component < width; ++component)
+            offset = (offset << 8u) | bytes[static_cast<size_t>(i) * width + component];
+        output[static_cast<size_t>(i)] = currentListBase + offset;
+    }
+}
+
+} // namespace
+
+GLuint DisplayListManager::listBase() { return currentListBase; }
+
 GLuint glGenLists(GLsizei range) {
     // LOG()
     // LOG_D("glGenLists(%i)", range)
+    if (range < 0) {
+        g_glstate.set_error(GL_INVALID_VALUE);
+        return 0;
+    }
     GLuint first = DisplayListManager::genDisplayList(range);
     // LOG_D("-> ", first)
     return first;
@@ -25,6 +54,10 @@ GLuint glGenLists(GLsizei range) {
 void glDeleteLists(GLuint list, GLsizei range) {
     // LOG()
     // LOG_D("glDeleteLists(%d, %i)", list, range)
+    if (range < 0) {
+        g_glstate.set_error(GL_INVALID_VALUE);
+        return;
+    }
     DisplayListManager::deleteDisplayList(list, range);
 }
 
@@ -35,18 +68,46 @@ GLboolean glIsList(GLuint list) {
 }
 
 void glNewList(GLuint list, GLenum mode) {
+    sfpewEntryBarrier();
     // LOG()
     // LOG_D("glNewList(%d, %s)", list, glEnumToString(mode))
+    if (list == 0) {
+        g_glstate.set_error(GL_INVALID_VALUE);
+        return;
+    }
+    if (mode != GL_COMPILE && mode != GL_COMPILE_AND_EXECUTE) {
+        g_glstate.set_error(GL_INVALID_ENUM);
+        return;
+    }
+    if (DisplayListManager::shouldRecord()) { // glNewList inside glNewList
+        g_glstate.set_error(GL_INVALID_OPERATION);
+        return;
+    }
     DisplayListManager::startRecord(list, mode);
 }
 
 void glEndList() {
     // LOG()
     // LOG_D("glEndLists()")
+    if (!DisplayListManager::shouldRecord()) { // glEndList without glNewList
+        g_glstate.set_error(GL_INVALID_OPERATION);
+        return;
+    }
     DisplayListManager::endRecord();
 }
 
 void glCallList(GLuint list) {
+    // Entry strict resolve: replayed commands (matrix transforms, captured
+    // draws) use the relaxed snapshot accessor and rely on this anchor.
+    (void)g_glstate;
+    // Flush-only: the specialized replay commands (captured draws, compiled
+    // immediate runs, matrix transforms) establish the wrapper's own draw
+    // state exactly like a live fixed-function draw, and every generic
+    // recorded command replays through its own exported entry point, which
+    // applies that entry's own barrier discipline. Restoring the app's state
+    // here just made each glCallList pay a glUseProgram round trip that the
+    // first replayed draw immediately undid.
+    flushPendingImmediateDraws();
     // LOG()
     // LOG_D("glCallList(%d)", list)
 
@@ -54,78 +115,102 @@ void glCallList(GLuint list) {
         displayListManager.record<glCallList>({}, list);
         if (DisplayListManager::shouldFinish()) return;
     }
-    GET_PREV_PROGRAM
-    DisplayListManager::callList(list);
-    SET_PREV_PROGRAM
+    if (DisplayListManager::isCalling()) {
+        DisplayListManager::callList(list);
+    } else {
+        fpe_backend_draw_state_guard_t backendState(
+            sfpewLogicalProgram(), static_cast<GLint>(sfpewLogicalArrayBufferBinding()));
+        if (!DisplayListManager::callSingleCaptured(list)) DisplayListManager::callList(list);
+    }
 }
 
 void glCallLists(GLsizei n, GLenum type, const GLvoid* lists) {
+    // Entry strict resolve; see glCallList (flush-only for the same reason).
+    (void)g_glstate;
+    flushPendingImmediateDraws();
     // LOG()
     // LOG_D("glCallLists(%i, %s, %p)", n, glEnumToString(type), lists)
+
+    // Validate before the record path: n * type_to_bytes(type) feeds a
+    // size_t deep-copy, so a negative n underflows to a huge memcpy and an
+    // unknown type yields a zero-size copy replayed against garbage.
+    if (n < 0) {
+        g_glstate.set_error(GL_INVALID_VALUE);
+        return;
+    }
+    switch (type) {
+    case GL_BYTE:
+    case GL_UNSIGNED_BYTE:
+    case GL_SHORT:
+    case GL_UNSIGNED_SHORT:
+    case GL_INT:
+    case GL_UNSIGNED_INT:
+    case GL_FLOAT:
+    case GL_2_BYTES:
+    case GL_3_BYTES:
+    case GL_4_BYTES:
+        break;
+    default:
+        g_glstate.set_error(GL_INVALID_ENUM);
+        return;
+    }
+    if (n == 0 || lists == nullptr) return;
 
     if (DisplayListManager::shouldRecord()) {
         displayListManager.record<glCallLists>({{2, n * PointerUtils::type_to_bytes(type)}}, n, type, lists);
         if (DisplayListManager::shouldFinish()) return;
     }
-    GET_PREV_PROGRAM
-    const auto* ptr = static_cast<const uint8_t*>(lists);
-    for (int i = 0; i < n; ++i) {
-        GLuint offset = 0;
+    thread_local std::vector<GLuint> decodedListIds;
+    decodedListIds.clear();
+    const size_t listCount = n > 0 ? static_cast<size_t>(n) : 0u;
+    const GLuint* listIds = nullptr;
+    if (listCount != 0 && type == GL_UNSIGNED_INT && currentListBase == 0 &&
+        reinterpret_cast<uintptr_t>(lists) % alignof(GLuint) == 0) {
+        listIds = static_cast<const GLuint*>(lists);
+    } else if (listCount != 0) {
+        decodedListIds.assign(listCount, currentListBase);
         switch (type) {
         case GL_BYTE:
-            offset = static_cast<GLuint>(*reinterpret_cast<const GLbyte*>(ptr));
-            ptr += 1;
+            decodeNativeListIds<GLbyte>(n, lists, decodedListIds);
             break;
         case GL_UNSIGNED_BYTE:
-            offset = *reinterpret_cast<const GLubyte*>(ptr);
-            ptr += 1;
+            decodeNativeListIds<GLubyte>(n, lists, decodedListIds);
             break;
         case GL_SHORT:
-            offset = static_cast<GLuint>(*reinterpret_cast<const GLshort*>(ptr));
-            ptr += 2;
+            decodeNativeListIds<GLshort>(n, lists, decodedListIds);
             break;
         case GL_UNSIGNED_SHORT:
-            offset = *reinterpret_cast<const GLushort*>(ptr);
-            ptr += 2;
+            decodeNativeListIds<GLushort>(n, lists, decodedListIds);
             break;
         case GL_INT:
-            offset = static_cast<GLuint>(*reinterpret_cast<const GLint*>(ptr));
-            ptr += 4;
+            decodeNativeListIds<GLint>(n, lists, decodedListIds);
             break;
         case GL_UNSIGNED_INT:
-            offset = *reinterpret_cast<const GLuint*>(ptr);
-            ptr += 4;
+            decodeNativeListIds<GLuint>(n, lists, decodedListIds);
             break;
         case GL_FLOAT:
-            offset = static_cast<GLuint>(*reinterpret_cast<const GLfloat*>(ptr));
-            ptr += 4;
+            decodeNativeListIds<GLfloat>(n, lists, decodedListIds);
             break;
-        case GL_2_BYTES: {
-            const auto* bytes = reinterpret_cast<const GLubyte*>(ptr);
-            offset = (static_cast<GLuint>(bytes[0]) << 8) | bytes[1];
-            ptr += 2;
+        case GL_2_BYTES:
+            decodePackedListIds(n, 2, lists, decodedListIds);
             break;
-        }
-        case GL_3_BYTES: {
-            const auto* bytes = reinterpret_cast<const GLubyte*>(ptr);
-            offset = (static_cast<GLuint>(bytes[0]) << 16) | (static_cast<GLuint>(bytes[1]) << 8) | bytes[2];
-            ptr += 3;
+        case GL_3_BYTES:
+            decodePackedListIds(n, 3, lists, decodedListIds);
             break;
-        }
-        case GL_4_BYTES: {
-            const auto* bytes = reinterpret_cast<const GLubyte*>(ptr);
-            offset = (static_cast<GLuint>(bytes[0]) << 24) | (static_cast<GLuint>(bytes[1]) << 16) |
-                     (static_cast<GLuint>(bytes[2]) << 8) | bytes[3];
-            ptr += 4;
+        case GL_4_BYTES:
+            decodePackedListIds(n, 4, lists, decodedListIds);
             break;
-        }
         default:
-            // LOG_W("ERROR: Failed to handle lists and type!")
+            // Preserve the legacy fallback: invalid types call listBase n times.
             break;
         }
-        DisplayListManager::callList(currentListBase + offset);
+        listIds = decodedListIds.data();
     }
-    SET_PREV_PROGRAM
+
+    fpe_backend_draw_state_guard_t backendState(
+        sfpewLogicalProgram(), static_cast<GLint>(sfpewLogicalArrayBufferBinding()));
+    if (tryExecuteCapturedDisplayLists(listIds, listCount)) return;
+    for (size_t i = 0; i < listCount; ++i) DisplayListManager::callList(listIds[i]);
 }
 
 void glListBase(GLuint base) {

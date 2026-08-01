@@ -8,21 +8,326 @@
 
 #include "EGL/egl.h"
 #include "init.h"
+#include "log.h"
+#include <cstdio>
 #include "fpe/transformation.h"
+#include "fpe/drawing1x.h" // sfpewEntryBarrier: the swap must drain the pending batch
 
 #define GETPROC(name, var)                                                                                             \
     if (std::strcmp(#name, var) == 0) {                                                                                \
         return (__eglMustCastToProperFunctionPointerType)name;                                                         \
     }
 
+// Desktop-only EXT/ARB spellings that are exactly the backend's core GLES
+// function: the backend's own eglGetProcAddress would return NULL for
+// these names, so they resolve against the loaded function table instead.
+#define GETPROC_BACKEND_ALIAS(alias, core)                                                                             \
+    if (std::strcmp(#alias, name) == 0) {                                                                              \
+        if (!sfpewEnsureBackend() || g_glFuncs.core == nullptr) return nullptr;                                         \
+        return (__eglMustCastToProperFunctionPointerType)g_glFuncs.core;                                                \
+    }
+
+// An EXT/ARB spelling of an entry point the WRAPPER implements. Distinct from
+// GETPROC_BACKEND_ALIAS, which hands out the backend's own pointer: for a
+// wrapped entry that would bypass the wrapper entirely, and legacy frontends
+// (LWJGL2) ask for the ARB spellings by preference.
+#define GETPROC_WRAPPER_ALIAS(alias, wrapped)                                                                          \
+    if (std::strcmp(#alias, name) == 0) {                                                                              \
+        return (__eglMustCastToProperFunctionPointerType)wrapped;                                                      \
+    }
+
 SFPEW_APIENTRY __eglMustCastToProperFunctionPointerType eglGetProcAddress(const char* name) {
     if (!name) return nullptr;
 
+    // Routing eglMakeCurrent through the wrapper turns the current context
+    // from something every state access has to ask libEGL about into a plain
+    // thread-local read (see sfpewCurrentContext). Apps that call libEGL
+    // directly keep the polling path and stay correct.
+    if (std::strcmp("eglMakeCurrent", name) == 0) {
+        // The internal name matters: taking the address of the exported
+        // eglMakeCurrent would go through this library's GOT, where an
+        // already-loaded libEGL interposes its own definition and the
+        // wrapper never sees the call.
+        return (__eglMustCastToProperFunctionPointerType)sfpewEglMakeCurrent;
+    }
+    // Same reasoning for the swap: the wrapper has to drain its pending batch
+    // before the frame is presented, or geometry drawn late in the frame is
+    // submitted into the next one and cleared away.
+    if (std::strcmp("eglSwapBuffers", name) == 0)
+        return (__eglMustCastToProperFunctionPointerType)sfpewEglSwapBuffers;
+    if (std::strcmp("eglSwapBuffersWithDamageEXT", name) == 0 ||
+        std::strcmp("eglSwapBuffersWithDamageKHR", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)sfpewEglSwapBuffersWithDamageEXT;
+    }
+
+    GETPROC(glGetError, name)
     GETPROC(glGetString, name)
     GETPROC(glGetStringi, name)
     GETPROC(glGetIntegerv, name)
+    GETPROC(glGetBooleanv, name)
+    GETPROC(glGetDoublev, name)
+    GETPROC(glIsEnabled, name)
+    GETPROC(glGetLightfv, name)
+    GETPROC(glGetLightiv, name)
+    GETPROC(glGetMaterialfv, name)
+    GETPROC(glGetMaterialiv, name)
+    GETPROC(glGetTexEnvfv, name)
+    GETPROC(glGetTexEnviv, name)
+    GETPROC(glGetTexGenfv, name)
+    GETPROC(glGetTexGeniv, name)
+    GETPROC(glGetTexGendv, name)
     GETPROC(glDrawArrays, name)
+    GETPROC(glDrawElements, name)
+    // GL 1.2/1.4 core draw entry points. Passing these through raw skipped
+    // legacy-mode conversion, fixed-function array wiring and the emulated
+    // alpha-test uniforms.
+    GETPROC(glDrawRangeElements, name)
+    GETPROC(glMultiDrawArrays, name)
+    GETPROC(glMultiDrawElements, name)
+    if (std::strcmp("glDrawRangeElementsEXT", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glDrawRangeElements;
+    }
+    if (std::strcmp("glMultiDrawArraysEXT", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glMultiDrawArrays;
+    }
+    if (std::strcmp("glMultiDrawElementsEXT", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glMultiDrawElements;
+    }
+    GETPROC(glClear, name)
+    GETPROC(glReadPixels, name)
+    GETPROC(glFlush, name)
+    GETPROC(glFinish, name)
+    GETPROC(glBindFramebuffer, name)
+    if (std::strcmp("glBindFramebufferEXT", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glBindFramebuffer;
+    }
+    GETPROC(glUseProgram, name)
+    GETPROC(glCreateShader, name)
+    GETPROC(glDeleteShader, name)
+    GETPROC(glShaderSource, name)
+    GETPROC(glCompileShader, name)
+    GETPROC(glGetShaderSource, name)
+    GETPROC(glGetShaderInfoLog, name)
+    if (std::strcmp("glShaderSourceARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glShaderSource;
+    }
+    if (std::strcmp("glCompileShaderARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glCompileShader;
+    }
+    GETPROC(glLinkProgram, name)
+    if (std::strcmp("glLinkProgramARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glLinkProgram;
+    }
+    GETPROC(glAttachShader, name)
+    GETPROC(glDetachShader, name)
+    GETPROC(glDeleteProgram, name)
+    GETPROC(glGetShaderiv, name)
+    GETPROC(glGetProgramiv, name)
+    GETPROC(glGetAttachedShaders, name)
+    GETPROC(glGetProgramInfoLog, name)
+    GETPROC(glGetUniformLocation, name)
+    GETPROC(glGetAttribLocation, name)
+
+    // --- Desktop FBO surface (GL_EXT_framebuffer_object + ARB core) ------
+    // LWJGL only flips its FBO capability bit when EVERY function of the
+    // extension resolves; keep this family complete.
+    GETPROC(glRenderbufferStorage, name)
+    GETPROC(glRenderbufferStorageMultisample, name)
+    GETPROC(glFramebufferTexture1D, name)
+    GETPROC(glFramebufferTexture3D, name)
+    if (std::strcmp("glRenderbufferStorageEXT", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glRenderbufferStorage;
+    }
+    if (std::strcmp("glRenderbufferStorageMultisampleEXT", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glRenderbufferStorageMultisample;
+    }
+    if (std::strcmp("glFramebufferTexture1DEXT", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glFramebufferTexture1D;
+    }
+    if (std::strcmp("glFramebufferTexture3DEXT", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glFramebufferTexture3D;
+    }
+    GETPROC_BACKEND_ALIAS(glGenFramebuffersEXT, glGenFramebuffers)
+    GETPROC_BACKEND_ALIAS(glDeleteFramebuffersEXT, glDeleteFramebuffers)
+    GETPROC_BACKEND_ALIAS(glIsFramebufferEXT, glIsFramebuffer)
+    GETPROC_BACKEND_ALIAS(glCheckFramebufferStatusEXT, glCheckFramebufferStatus)
+    GETPROC_BACKEND_ALIAS(glFramebufferTexture2DEXT, glFramebufferTexture2D)
+    GETPROC_BACKEND_ALIAS(glFramebufferRenderbufferEXT, glFramebufferRenderbuffer)
+    GETPROC_BACKEND_ALIAS(glGetFramebufferAttachmentParameterivEXT, glGetFramebufferAttachmentParameteriv)
+    GETPROC_BACKEND_ALIAS(glGenRenderbuffersEXT, glGenRenderbuffers)
+    GETPROC_BACKEND_ALIAS(glDeleteRenderbuffersEXT, glDeleteRenderbuffers)
+    GETPROC_BACKEND_ALIAS(glIsRenderbufferEXT, glIsRenderbuffer)
+    GETPROC_BACKEND_ALIAS(glBindRenderbufferEXT, glBindRenderbuffer)
+    GETPROC_BACKEND_ALIAS(glGetRenderbufferParameterivEXT, glGetRenderbufferParameteriv)
+    GETPROC_BACKEND_ALIAS(glGenerateMipmapEXT, glGenerateMipmap)
+    GETPROC_BACKEND_ALIAS(glBlitFramebufferEXT, glBlitFramebuffer)
+    GETPROC_BACKEND_ALIAS(glDrawBuffersARB, glDrawBuffers)
+    GETPROC_BACKEND_ALIAS(glDrawBuffersATI, glDrawBuffers)
+
+    // --- ARB_shader_objects / ARB_vertex_shader value setters ------------
+    GETPROC_BACKEND_ALIAS(glUniform1fARB, glUniform1f)
+    GETPROC_BACKEND_ALIAS(glUniform2fARB, glUniform2f)
+    GETPROC_BACKEND_ALIAS(glUniform3fARB, glUniform3f)
+    GETPROC_BACKEND_ALIAS(glUniform4fARB, glUniform4f)
+    GETPROC_BACKEND_ALIAS(glUniform1iARB, glUniform1i)
+    GETPROC_BACKEND_ALIAS(glUniform2iARB, glUniform2i)
+    GETPROC_BACKEND_ALIAS(glUniform3iARB, glUniform3i)
+    GETPROC_BACKEND_ALIAS(glUniform4iARB, glUniform4i)
+    GETPROC_BACKEND_ALIAS(glUniform1fvARB, glUniform1fv)
+    GETPROC_BACKEND_ALIAS(glUniform2fvARB, glUniform2fv)
+    GETPROC_BACKEND_ALIAS(glUniform3fvARB, glUniform3fv)
+    GETPROC_BACKEND_ALIAS(glUniform4fvARB, glUniform4fv)
+    GETPROC_BACKEND_ALIAS(glUniform1ivARB, glUniform1iv)
+    GETPROC_BACKEND_ALIAS(glUniform2ivARB, glUniform2iv)
+    GETPROC_BACKEND_ALIAS(glUniform3ivARB, glUniform3iv)
+    GETPROC_BACKEND_ALIAS(glUniform4ivARB, glUniform4iv)
+    GETPROC_BACKEND_ALIAS(glUniformMatrix2fvARB, glUniformMatrix2fv)
+    GETPROC_BACKEND_ALIAS(glUniformMatrix3fvARB, glUniformMatrix3fv)
+    GETPROC_BACKEND_ALIAS(glUniformMatrix4fvARB, glUniformMatrix4fv)
+    GETPROC_BACKEND_ALIAS(glValidateProgramARB, glValidateProgram)
+    GETPROC_BACKEND_ALIAS(glBindAttribLocationARB, glBindAttribLocation)
+    GETPROC_BACKEND_ALIAS(glGetActiveUniformARB, glGetActiveUniform)
+    GETPROC_BACKEND_ALIAS(glGetActiveAttribARB, glGetActiveAttrib)
+    GETPROC_BACKEND_ALIAS(glGetUniformfvARB, glGetUniformfv)
+    GETPROC_BACKEND_ALIAS(glGetUniformivARB, glGetUniformiv)
+    GETPROC_WRAPPER_ALIAS(glVertexAttribPointerARB, glVertexAttribPointer)
+    GETPROC_WRAPPER_ALIAS(glEnableVertexAttribArrayARB, glEnableVertexAttribArray)
+    GETPROC_WRAPPER_ALIAS(glDisableVertexAttribArrayARB, glDisableVertexAttribArray)
+    GETPROC_BACKEND_ALIAS(glVertexAttrib1fARB, glVertexAttrib1f)
+    GETPROC_BACKEND_ALIAS(glVertexAttrib2fARB, glVertexAttrib2f)
+    GETPROC_BACKEND_ALIAS(glVertexAttrib3fARB, glVertexAttrib3f)
+    GETPROC_BACKEND_ALIAS(glVertexAttrib4fARB, glVertexAttrib4f)
+    GETPROC_BACKEND_ALIAS(glVertexAttrib1fvARB, glVertexAttrib1fv)
+    GETPROC_BACKEND_ALIAS(glVertexAttrib2fvARB, glVertexAttrib2fv)
+    GETPROC_BACKEND_ALIAS(glVertexAttrib3fvARB, glVertexAttrib3fv)
+    GETPROC_BACKEND_ALIAS(glVertexAttrib4fvARB, glVertexAttrib4fv)
+
+    // --- ARB_vertex_buffer_object / GL15 buffer surface -------------------
+    GETPROC(glMapBuffer, name)
+    GETPROC(glGetBufferSubData, name)
+    if (std::strcmp("glMapBufferARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glMapBuffer;
+    }
+    if (std::strcmp("glGetBufferSubDataARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glGetBufferSubData;
+    }
+    GETPROC_BACKEND_ALIAS(glGenBuffersARB, glGenBuffers)
+    GETPROC_WRAPPER_ALIAS(glBufferDataARB, glBufferData)
+    GETPROC_WRAPPER_ALIAS(glBufferSubDataARB, glBufferSubData)
+    GETPROC_BACKEND_ALIAS(glIsBufferARB, glIsBuffer)
+    GETPROC_WRAPPER_ALIAS(glGetBufferParameterivARB, glGetBufferParameteriv)
+    GETPROC_WRAPPER_ALIAS(glUnmapBufferARB, glUnmapBuffer)
+    if (std::strcmp("glGetUniformLocationARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glGetUniformLocation;
+    }
+    if (std::strcmp("glGetAttribLocationARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glGetAttribLocation;
+    }
+    if (std::strcmp("glGetShaderSourceARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glGetShaderSource;
+    }
+    if (std::strcmp("glCreateShaderObjectARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)sfpewCreateShaderObjectARB;
+    }
+    if (std::strcmp("glCreateProgramObjectARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)sfpewCreateProgramObjectARB;
+    }
+    if (std::strcmp("glDeleteObjectARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)sfpewDeleteObjectARB;
+    }
+    if (std::strcmp("glAttachObjectARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)sfpewAttachObjectARB;
+    }
+    if (std::strcmp("glDetachObjectARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)sfpewDetachObjectARB;
+    }
+    if (std::strcmp("glGetObjectParameterivARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)sfpewGetObjectParameterivARB;
+    }
+    if (std::strcmp("glGetInfoLogARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)sfpewGetInfoLogARB;
+    }
+    if (std::strcmp("glGetHandleARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)sfpewGetHandleARB;
+    }
+    if (std::strcmp("glUseProgramObjectARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glUseProgram;
+    }
+
+    GETPROC(glBlendColor, name)
+    GETPROC(glBlendEquation, name)
+    GETPROC(glBlendEquationSeparate, name)
+    GETPROC(glBlendFunc, name)
+    GETPROC(glBlendFuncSeparate, name)
+    // The blend extensions the wrapper advertises resolve by their EXT/ARB
+    // spellings too: LWJGL only enables GL_EXT_blend_func_separate &c. when
+    // every function of the extension resolves, and legacy Minecraft calls
+    // glBlendFuncSeparateEXT on that path (translucent foliage/water).
+    // These map to the wrapper's own entry points so display-list recording
+    // and state tracking stay intact.
+    if (std::strcmp("glBlendFuncSeparateEXT", name) == 0 ||
+        std::strcmp("glBlendFuncSeparateARB", name) == 0 ||
+        std::strcmp("glBlendFuncSeparateINGR", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glBlendFuncSeparate;
+    }
+    if (std::strcmp("glBlendEquationEXT", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glBlendEquation;
+    }
+    if (std::strcmp("glBlendEquationSeparateEXT", name) == 0 ||
+        std::strcmp("glBlendEquationSeparateATI", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glBlendEquationSeparate;
+    }
+    if (std::strcmp("glBlendColorEXT", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glBlendColor;
+    }
+    GETPROC(glDepthFunc, name)
+    GETPROC(glDepthMask, name)
+    GETPROC(glColorMask, name)
+    GETPROC(glCullFace, name)
+    GETPROC(glFrontFace, name)
+    GETPROC(glViewport, name)
+    GETPROC(glScissor, name)
+    GETPROC(glPolygonOffset, name)
+    GETPROC(glLineWidth, name)
+    GETPROC(glStencilFunc, name)
+    GETPROC(glStencilMask, name)
+    GETPROC(glStencilOp, name)
+    GETPROC(glTexParameterf, name)
+    GETPROC(glTexParameterfv, name)
+    GETPROC(glTexParameteri, name)
+    GETPROC(glTexParameteriv, name)
+    GETPROC(glTexSubImage2D, name)
+    GETPROC(glBindBuffer, name)
+    // Wrapped so the fixed-function draw guard can restore the app's VAO
+    // from a shadow instead of querying the driver on every draw.
+    GETPROC(glBindVertexArray, name)
+    GETPROC(glDeleteVertexArrays, name)
+    GETPROC(glDeleteBuffers, name)
+    // Reads and writes through the bound GL_ARRAY_BUFFER / VAO. Wrapped so
+    // they stay visible to the wrapper rather than resolving to the backend's
+    // own pointer (plans/12).
+    GETPROC(glBufferData, name)
+    GETPROC(glBufferSubData, name)
+    GETPROC(glMapBufferRange, name)
+    GETPROC(glUnmapBuffer, name)
+    GETPROC(glGetBufferParameteriv, name)
+    GETPROC(glVertexAttribPointer, name)
+    GETPROC(glVertexAttribIPointer, name)
+    GETPROC(glEnableVertexAttribArray, name)
+    GETPROC(glDisableVertexAttribArray, name)
+    if (std::strcmp("glBindBufferARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glBindBuffer;
+    }
+    if (std::strcmp("glDeleteBuffersARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glDeleteBuffers;
+    }
+    GETPROC(glActiveTexture, name)
+    GETPROC(glBindTexture, name)
+    GETPROC(glDeleteTextures, name)
     GETPROC(glTexImage2D, name)
+    GETPROC(glTexImage1D, name)
+    GETPROC(glTexSubImage1D, name)
+    GETPROC(glGetTexImage, name)
     GETPROC(glGetTexLevelParameteriv, name)
     GETPROC(glGetTexLevelParameterfv, name)
 
@@ -101,6 +406,287 @@ SFPEW_APIENTRY __eglMustCastToProperFunctionPointerType eglGetProcAddress(const 
     if (std::strcmp("glMultiTexCoord2fARB", name) == 0) {
         return (__eglMustCastToProperFunctionPointerType)glMultiTexCoord2f;
     }
+    GETPROC(glTexCoord1d, name)
+    GETPROC(glTexCoord1f, name)
+    GETPROC(glTexCoord1i, name)
+    GETPROC(glTexCoord1s, name)
+    GETPROC(glTexCoord2d, name)
+    GETPROC(glTexCoord2i, name)
+    GETPROC(glTexCoord2s, name)
+    GETPROC(glTexCoord3d, name)
+    GETPROC(glTexCoord3f, name)
+    GETPROC(glTexCoord3i, name)
+    GETPROC(glTexCoord3s, name)
+    GETPROC(glTexCoord4d, name)
+    GETPROC(glTexCoord4i, name)
+    GETPROC(glTexCoord4s, name)
+    GETPROC(glTexCoord1dv, name)
+    GETPROC(glTexCoord1fv, name)
+    GETPROC(glTexCoord1iv, name)
+    GETPROC(glTexCoord1sv, name)
+    GETPROC(glTexCoord2dv, name)
+    GETPROC(glTexCoord2fv, name)
+    GETPROC(glTexCoord2iv, name)
+    GETPROC(glTexCoord2sv, name)
+    GETPROC(glTexCoord3dv, name)
+    GETPROC(glTexCoord3fv, name)
+    GETPROC(glTexCoord3iv, name)
+    GETPROC(glTexCoord3sv, name)
+    GETPROC(glTexCoord4dv, name)
+    GETPROC(glTexCoord4fv, name)
+    GETPROC(glTexCoord4iv, name)
+    GETPROC(glTexCoord4sv, name)
+    GETPROC(glMultiTexCoord1d, name)
+    if (std::strcmp("glMultiTexCoord1dARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glMultiTexCoord1d;
+    }
+    GETPROC(glMultiTexCoord1f, name)
+    if (std::strcmp("glMultiTexCoord1fARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glMultiTexCoord1f;
+    }
+    GETPROC(glMultiTexCoord1i, name)
+    if (std::strcmp("glMultiTexCoord1iARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glMultiTexCoord1i;
+    }
+    GETPROC(glMultiTexCoord1s, name)
+    if (std::strcmp("glMultiTexCoord1sARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glMultiTexCoord1s;
+    }
+    GETPROC(glMultiTexCoord2d, name)
+    if (std::strcmp("glMultiTexCoord2dARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glMultiTexCoord2d;
+    }
+    if (std::strcmp("glMultiTexCoord2fARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glMultiTexCoord2f;
+    }
+    GETPROC(glMultiTexCoord2i, name)
+    if (std::strcmp("glMultiTexCoord2iARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glMultiTexCoord2i;
+    }
+    GETPROC(glMultiTexCoord2s, name)
+    if (std::strcmp("glMultiTexCoord2sARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glMultiTexCoord2s;
+    }
+    GETPROC(glMultiTexCoord3d, name)
+    if (std::strcmp("glMultiTexCoord3dARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glMultiTexCoord3d;
+    }
+    GETPROC(glMultiTexCoord3f, name)
+    if (std::strcmp("glMultiTexCoord3fARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glMultiTexCoord3f;
+    }
+    GETPROC(glMultiTexCoord3i, name)
+    if (std::strcmp("glMultiTexCoord3iARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glMultiTexCoord3i;
+    }
+    GETPROC(glMultiTexCoord3s, name)
+    if (std::strcmp("glMultiTexCoord3sARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glMultiTexCoord3s;
+    }
+    GETPROC(glMultiTexCoord4d, name)
+    if (std::strcmp("glMultiTexCoord4dARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glMultiTexCoord4d;
+    }
+    if (std::strcmp("glMultiTexCoord4fARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glMultiTexCoord4f;
+    }
+    GETPROC(glMultiTexCoord4i, name)
+    if (std::strcmp("glMultiTexCoord4iARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glMultiTexCoord4i;
+    }
+    GETPROC(glMultiTexCoord4s, name)
+    if (std::strcmp("glMultiTexCoord4sARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glMultiTexCoord4s;
+    }
+    GETPROC(glMultiTexCoord1dv, name)
+    if (std::strcmp("glMultiTexCoord1dvARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glMultiTexCoord1dv;
+    }
+    GETPROC(glMultiTexCoord1fv, name)
+    if (std::strcmp("glMultiTexCoord1fvARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glMultiTexCoord1fv;
+    }
+    GETPROC(glMultiTexCoord1iv, name)
+    if (std::strcmp("glMultiTexCoord1ivARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glMultiTexCoord1iv;
+    }
+    GETPROC(glMultiTexCoord1sv, name)
+    if (std::strcmp("glMultiTexCoord1svARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glMultiTexCoord1sv;
+    }
+    GETPROC(glMultiTexCoord2dv, name)
+    if (std::strcmp("glMultiTexCoord2dvARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glMultiTexCoord2dv;
+    }
+    GETPROC(glMultiTexCoord2fv, name)
+    if (std::strcmp("glMultiTexCoord2fvARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glMultiTexCoord2fv;
+    }
+    GETPROC(glMultiTexCoord2iv, name)
+    if (std::strcmp("glMultiTexCoord2ivARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glMultiTexCoord2iv;
+    }
+    GETPROC(glMultiTexCoord2sv, name)
+    if (std::strcmp("glMultiTexCoord2svARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glMultiTexCoord2sv;
+    }
+    GETPROC(glMultiTexCoord3dv, name)
+    if (std::strcmp("glMultiTexCoord3dvARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glMultiTexCoord3dv;
+    }
+    GETPROC(glMultiTexCoord3fv, name)
+    if (std::strcmp("glMultiTexCoord3fvARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glMultiTexCoord3fv;
+    }
+    GETPROC(glMultiTexCoord3iv, name)
+    if (std::strcmp("glMultiTexCoord3ivARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glMultiTexCoord3iv;
+    }
+    GETPROC(glMultiTexCoord3sv, name)
+    if (std::strcmp("glMultiTexCoord3svARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glMultiTexCoord3sv;
+    }
+    GETPROC(glMultiTexCoord4dv, name)
+    if (std::strcmp("glMultiTexCoord4dvARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glMultiTexCoord4dv;
+    }
+    GETPROC(glMultiTexCoord4fv, name)
+    if (std::strcmp("glMultiTexCoord4fvARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glMultiTexCoord4fv;
+    }
+    GETPROC(glMultiTexCoord4iv, name)
+    if (std::strcmp("glMultiTexCoord4ivARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glMultiTexCoord4iv;
+    }
+    GETPROC(glMultiTexCoord4sv, name)
+    if (std::strcmp("glMultiTexCoord4svARB", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glMultiTexCoord4sv;
+    }
+    GETPROC(glPointSize, name)
+    GETPROC(glPolygonMode, name)
+    GETPROC(glPolygonStipple, name)
+    GETPROC(glGetPolygonStipple, name)
+    GETPROC(glLineStipple, name)
+    GETPROC(glTexGeni, name)
+    GETPROC(glTexGenf, name)
+    GETPROC(glTexGend, name)
+    GETPROC(glTexGeniv, name)
+    GETPROC(glTexGenfv, name)
+    GETPROC(glTexGendv, name)
+    GETPROC(glClipPlane, name)
+    GETPROC(glGetClipPlane, name)
+    GETPROC(glRasterPos2d, name)
+    GETPROC(glRasterPos2dv, name)
+    GETPROC(glRasterPos2f, name)
+    GETPROC(glRasterPos2fv, name)
+    GETPROC(glRasterPos2i, name)
+    GETPROC(glRasterPos2iv, name)
+    GETPROC(glRasterPos2s, name)
+    GETPROC(glRasterPos2sv, name)
+    GETPROC(glRasterPos3d, name)
+    GETPROC(glRasterPos3dv, name)
+    GETPROC(glRasterPos3f, name)
+    GETPROC(glRasterPos3fv, name)
+    GETPROC(glRasterPos3i, name)
+    GETPROC(glRasterPos3iv, name)
+    GETPROC(glRasterPos3s, name)
+    GETPROC(glRasterPos3sv, name)
+    GETPROC(glRasterPos4d, name)
+    GETPROC(glRasterPos4dv, name)
+    GETPROC(glRasterPos4f, name)
+    GETPROC(glRasterPos4fv, name)
+    GETPROC(glRasterPos4i, name)
+    GETPROC(glRasterPos4iv, name)
+    GETPROC(glRasterPos4s, name)
+    GETPROC(glRasterPos4sv, name)
+    GETPROC(glWindowPos2d, name)
+    GETPROC(glWindowPos2dv, name)
+    GETPROC(glWindowPos2f, name)
+    GETPROC(glWindowPos2fv, name)
+    GETPROC(glWindowPos2i, name)
+    GETPROC(glWindowPos2iv, name)
+    GETPROC(glWindowPos2s, name)
+    GETPROC(glWindowPos2sv, name)
+    GETPROC(glWindowPos3d, name)
+    GETPROC(glWindowPos3dv, name)
+    GETPROC(glWindowPos3f, name)
+    GETPROC(glWindowPos3fv, name)
+    GETPROC(glWindowPos3i, name)
+    GETPROC(glWindowPos3iv, name)
+    GETPROC(glWindowPos3s, name)
+    GETPROC(glWindowPos3sv, name)
+    GETPROC(glRectd, name)
+    GETPROC(glRectf, name)
+    GETPROC(glRecti, name)
+    GETPROC(glRects, name)
+    GETPROC(glRectdv, name)
+    GETPROC(glRectfv, name)
+    GETPROC(glRectiv, name)
+    GETPROC(glRectsv, name)
+    GETPROC(glDepthRange, name)
+    GETPROC(glHint, name)
+    GETPROC(glPixelStorei, name)
+    GETPROC(glPixelZoom, name)
+    GETPROC(glBitmap, name)
+    GETPROC(glDrawPixels, name)
+    GETPROC(glCopyPixels, name)
+    GETPROC(glPixelTransferf, name)
+    GETPROC(glPixelTransferi, name)
+    GETPROC(glPixelStoref, name)
+    GETPROC(glPushAttrib, name)
+    GETPROC(glPopAttrib, name)
+    GETPROC(glPushClientAttrib, name)
+    GETPROC(glPopClientAttrib, name)
+    GETPROC(glMap1f, name)
+    GETPROC(glMap1d, name)
+    GETPROC(glMap2f, name)
+    GETPROC(glMap2d, name)
+    GETPROC(glMapGrid1f, name)
+    GETPROC(glMapGrid1d, name)
+    GETPROC(glMapGrid2f, name)
+    GETPROC(glMapGrid2d, name)
+    GETPROC(glEvalCoord1f, name)
+    GETPROC(glEvalCoord1d, name)
+    GETPROC(glEvalCoord2f, name)
+    GETPROC(glEvalCoord2d, name)
+    GETPROC(glEvalCoord1fv, name)
+    GETPROC(glEvalCoord1dv, name)
+    GETPROC(glEvalCoord2fv, name)
+    GETPROC(glEvalCoord2dv, name)
+    GETPROC(glEvalPoint1, name)
+    GETPROC(glEvalPoint2, name)
+    GETPROC(glEvalMesh1, name)
+    GETPROC(glEvalMesh2, name)
+    GETPROC(glMap1f, name)
+    GETPROC(glMap1d, name)
+    GETPROC(glMap2f, name)
+    GETPROC(glMap2d, name)
+    GETPROC(glMapGrid1f, name)
+    GETPROC(glMapGrid1d, name)
+    GETPROC(glMapGrid2f, name)
+    GETPROC(glMapGrid2d, name)
+    GETPROC(glEvalCoord1f, name)
+    GETPROC(glEvalCoord1d, name)
+    GETPROC(glEvalCoord2f, name)
+    GETPROC(glEvalCoord2d, name)
+    GETPROC(glEvalCoord1fv, name)
+    GETPROC(glEvalCoord1dv, name)
+    GETPROC(glEvalCoord2fv, name)
+    GETPROC(glEvalCoord2dv, name)
+    GETPROC(glEvalPoint1, name)
+    GETPROC(glEvalPoint2, name)
+    GETPROC(glEvalMesh1, name)
+    GETPROC(glEvalMesh2, name)
+    GETPROC(glAccum, name)
+    GETPROC(glClearAccum, name)
+    GETPROC(glRenderMode, name)
+    GETPROC(glSelectBuffer, name)
+    GETPROC(glFeedbackBuffer, name)
+    GETPROC(glInitNames, name)
+    GETPROC(glPushName, name)
+    GETPROC(glPopName, name)
+    GETPROC(glLoadName, name)
+    GETPROC(glPassThrough, name)
     GETPROC(glGenLists, name)
     GETPROC(glDeleteLists, name)
     GETPROC(glIsList, name)
@@ -116,7 +702,7 @@ SFPEW_APIENTRY __eglMustCastToProperFunctionPointerType eglGetProcAddress(const 
         return (__eglMustCastToProperFunctionPointerType)glClientActiveTexture;
     }
     if (std::strcmp("glActiveTextureARB", name) == 0) {
-        return (__eglMustCastToProperFunctionPointerType)g_glFuncs.glActiveTexture;
+        return (__eglMustCastToProperFunctionPointerType)glActiveTexture;
     }
     GETPROC(glAlphaFunc, name)
     GETPROC(glFogf, name)
@@ -164,13 +750,48 @@ SFPEW_APIENTRY __eglMustCastToProperFunctionPointerType eglGetProcAddress(const 
     GETPROC(glColorPointer, name)
     GETPROC(glTexCoordPointer, name)
     GETPROC(glIndexPointer, name)
+    GETPROC(glInterleavedArrays, name)
+    GETPROC(glEdgeFlagPointer, name)
+    GETPROC(glEdgeFlag, name)
+    GETPROC(glEdgeFlagv, name)
+    GETPROC(glSecondaryColorPointer, name)
+    if (std::strcmp("glSecondaryColorPointerEXT", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glSecondaryColorPointer;
+    }
+    GETPROC(glFogCoordPointer, name)
+    if (std::strcmp("glFogCoordPointerEXT", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glFogCoordPointer;
+    }
+    // Immediate-mode fog coord (GL 1.4 core / EXT_fog_coord). Missing
+    // entirely before, so callers fell through to the backend's desktop
+    // symbol and hit GL_INVALID_OPERATION on a GLES context.
+    GETPROC(glFogCoordf, name)
+    GETPROC(glFogCoordd, name)
+    GETPROC(glFogCoordfv, name)
+    GETPROC(glFogCoorddv, name)
+    if (std::strcmp("glFogCoordfEXT", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glFogCoordf;
+    }
+    if (std::strcmp("glFogCoorddEXT", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glFogCoordd;
+    }
+    if (std::strcmp("glFogCoordfvEXT", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glFogCoordfv;
+    }
+    if (std::strcmp("glFogCoorddvEXT", name) == 0) {
+        return (__eglMustCastToProperFunctionPointerType)glFogCoorddv;
+    }
+    GETPROC(glArrayElement, name)
     GETPROC(glEnableClientState, name)
     GETPROC(glDisableClientState, name)
     GETPROC(glGetFloatv, name)
 
+    if (!sfpewEnsureBackend() || g_eglFuncs.eglGetProcAddress == nullptr) {
+        return nullptr;
+    }
     __eglMustCastToProperFunctionPointerType ptr = g_eglFuncs.eglGetProcAddress(name);
     if (!ptr) {
-        printf("eglGetProcAddress: eglGetProcAddress also failed to find '%s'\n", name);
+        SFPEW_LOGW("eglGetProcAddress: backend also failed to find '%s'", name);
     }
     return ptr;
 }
@@ -181,4 +802,75 @@ SFPEW_APIENTRY void* glXGetProcAddress(const char* name) {
 
 SFPEW_APIENTRY void* glXGetProcAddressARB(const char* name) {
     return glXGetProcAddress(name);
+}
+
+// Wrapping eglMakeCurrent lets the wrapper know the current context exactly
+// instead of asking libEGL on every state access; see sfpewCurrentContext.
+// Same signature and return value as the backend's, so an app can use this
+// as a drop-in (that is how gl4es-style loaders wire EGL through the
+// wrapper). The note happens only on success, so a failed switch leaves the
+// previously current context in place - which is what EGL guarantees.
+EGLBoolean sfpewEglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLContext ctx) {
+    if (!sfpewEnsureBackend() || g_eglFuncs.eglMakeCurrent == nullptr) return EGL_FALSE;
+    // Anything still batched belongs to the OUTGOING context: submit it while
+    // that context is current. flushPendingImmediateDraws() would otherwise
+    // find the context changed under it and drop the batch (correct, but the
+    // geometry is then simply lost).
+    sfpewEntryBarrier();
+    const EGLBoolean ok = g_eglFuncs.eglMakeCurrent(dpy, draw, read, ctx);
+    if (ok == EGL_TRUE) sfpewNoteCurrentContext(ctx);
+    return ok;
+}
+
+// A frame must not end with geometry still sitting in the wrapper.
+//
+// Small immediate-mode runs are accumulated so consecutive ones merge into one
+// draw, and the batch is drained by sfpewEntryBarrier() from the next entry
+// point that could observe it. Buffer swap was not such an entry point, so a
+// frame whose last drawing was immediate-mode left its batch pending across the
+// swap. The next frame's first entry point then drained it into the NEW back
+// buffer, where that frame's glClear immediately erased it: geometry drawn late
+// in a frame disappeared, and the depth it wrote landed in the wrong frame.
+// Reported as heavy flickering with the previous frame appearing not to clear,
+// wrong depth, and some components looking wrong.
+//
+// Draining here is also just what GL requires - all commands must be issued
+// before the swap.
+EGLBoolean sfpewEglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
+    if (!sfpewEnsureBackend() || g_eglFuncs.eglSwapBuffers == nullptr) return EGL_FALSE;
+    sfpewEntryBarrier();
+    return g_eglFuncs.eglSwapBuffers(dpy, surface);
+}
+
+EGLBoolean sfpewEglSwapBuffersWithDamageEXT(EGLDisplay dpy, EGLSurface surface, EGLint* rects,
+                                            EGLint n_rects) {
+    if (!sfpewEnsureBackend()) return EGL_FALSE;
+    sfpewEntryBarrier();
+    if (g_eglFuncs.eglSwapBuffersWithDamageEXT != nullptr)
+        return g_eglFuncs.eglSwapBuffersWithDamageEXT(dpy, surface, rects, n_rects);
+    // The damage rectangles are only a hint; a plain swap is a conforming
+    // fallback and keeps the flush above from being the reason a frame is lost.
+    if (g_eglFuncs.eglSwapBuffers != nullptr) return g_eglFuncs.eglSwapBuffers(dpy, surface);
+    return EGL_FALSE;
+}
+
+// Exported spellings for loaders that dlsym the wrapper for EGL.
+SFPEW_APIENTRY EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read,
+                                        EGLContext ctx) {
+    return sfpewEglMakeCurrent(dpy, draw, read, ctx);
+}
+
+SFPEW_APIENTRY EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
+    return sfpewEglSwapBuffers(dpy, surface);
+}
+
+SFPEW_APIENTRY EGLBoolean eglSwapBuffersWithDamageEXT(EGLDisplay dpy, EGLSurface surface,
+                                                      EGLint* rects, EGLint n_rects) {
+    return sfpewEglSwapBuffersWithDamageEXT(dpy, surface, rects, n_rects);
+}
+
+// KHR and EXT share the signature; both forward to the same flush-then-swap.
+SFPEW_APIENTRY EGLBoolean eglSwapBuffersWithDamageKHR(EGLDisplay dpy, EGLSurface surface,
+                                                      EGLint* rects, EGLint n_rects) {
+    return sfpewEglSwapBuffersWithDamageEXT(dpy, surface, rects, n_rects);
 }

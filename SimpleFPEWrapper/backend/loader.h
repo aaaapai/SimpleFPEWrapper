@@ -7,6 +7,15 @@
 // End of Source File Header
 
 #pragma once
+
+// Backend contract: this table is resolved against EITHER a desktop GL 3.2+
+// or a GLES 3.0+ context, and no codepath asks which one it got. Everything
+// declared here is resolved through eglGetProcAddress and every entry point
+// outside the GL 3.2 n ES 3.0 intersection is null-checked at its call site,
+// so a backend that lacks one takes the documented fallback instead of
+// crashing. Adding an entry point outside that intersection means adding a
+// null guard with it. See docs/backend-support.md for the audited list.
+
 #include <GL/gl.h>
 #include <GL/glext.h>
 #include <EGL/egl.h>
@@ -401,6 +410,20 @@ namespace SFPEW {
             GL_FUNC_TYPEDEF(void, glDrawArraysInstanced, GLenum mode, GLint first, GLsizei count, GLsizei instancecount)
             GL_FUNC_TYPEDEF(void, glDrawElementsInstanced, GLenum mode, GLsizei count, GLenum type, const void* indices,
                             GLsizei instancecount)
+            // Multi-draw comes in two spellings. Desktop GL has the unsuffixed
+            // pair in 1.4 core; GLES has neither in core and supplies the EXT
+            // pair through EXT_multi_draw_arrays. Whichever resolves is used,
+            // and the loop fallback covers a backend offering neither.
+            GL_FUNC_TYPEDEF(void, glMultiDrawArrays, GLenum mode, const GLint* first, const GLsizei* count,
+                            GLsizei drawcount)
+            GL_FUNC_TYPEDEF(void, glMultiDrawElements, GLenum mode, const GLsizei* count, GLenum type,
+                            const void* const* indices, GLsizei drawcount)
+            GL_FUNC_TYPEDEF(void, glMultiDrawArraysEXT, GLenum mode, const GLint* first, const GLsizei* count,
+                            GLsizei drawcount)
+            GL_FUNC_TYPEDEF(void, glMultiDrawElementsEXT, GLenum mode, const GLsizei* count, GLenum type,
+                            const void* const* indices, GLsizei drawcount)
+            GL_FUNC_TYPEDEF(void, glMultiDrawElementsBaseVertex, GLenum mode, const GLsizei* count, GLenum type,
+                            const void* const* indices, GLsizei drawcount, const GLint* basevertex)
             GL_FUNC_TYPEDEF(GLsync, glFenceSync, GLenum condition, GLbitfield flags)
             GL_FUNC_TYPEDEF(GLboolean, glIsSync, GLsync sync)
             GL_FUNC_TYPEDEF(void, glDeleteSync, GLsync sync)
@@ -607,6 +630,8 @@ namespace SFPEW {
                             GLsizei width, GLsizei height, GLsizei depth, GLboolean fixedsamplelocations)
             GL_FUNC_TYPEDEF(void*, glMapBufferRange, GLenum target, GLintptr offset, GLsizeiptr length,
                             GLbitfield access)
+            GL_FUNC_TYPEDEF(void, glBufferStorage, GLenum target, GLsizeiptr size, const void* data,
+                            GLbitfield flags)
             GL_FUNC_TYPEDEF(void, glBufferStorageEXT, GLenum target, GLsizeiptr size, const void* data,
                             GLbitfield flags)
             GL_FUNC_TYPEDEF(void, glGetQueryObjectivEXT, GLuint id, GLenum pname, GLint* params)
@@ -835,6 +860,11 @@ namespace SFPEW {
             GL_FUNC_DECL(glUniformBlockBinding)
             GL_FUNC_DECL(glDrawArraysInstanced)
             GL_FUNC_DECL(glDrawElementsInstanced)
+            GL_FUNC_DECL(glMultiDrawArrays)
+            GL_FUNC_DECL(glMultiDrawElements)
+            GL_FUNC_DECL(glMultiDrawArraysEXT)
+            GL_FUNC_DECL(glMultiDrawElementsEXT)
+            GL_FUNC_DECL(glMultiDrawElementsBaseVertex)
             GL_FUNC_DECL(glFenceSync)
             GL_FUNC_DECL(glIsSync)
             GL_FUNC_DECL(glDeleteSync)
@@ -982,6 +1012,7 @@ namespace SFPEW {
             GL_FUNC_DECL(glTexBufferRange)
             GL_FUNC_DECL(glTexStorage3DMultisample)
             GL_FUNC_DECL(glMapBufferRange)
+            GL_FUNC_DECL(glBufferStorage)
             GL_FUNC_DECL(glBufferStorageEXT)
             GL_FUNC_DECL(glGetQueryObjectivEXT)
             GL_FUNC_DECL(glGetQueryObjecti64vEXT)

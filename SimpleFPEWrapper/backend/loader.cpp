@@ -268,6 +268,11 @@ namespace SFPEW::Utils::BackendLoader {
             INIT_BACKENDGL_FUNC(glUniformBlockBinding)
             INIT_BACKENDGL_FUNC(glDrawArraysInstanced)
             INIT_BACKENDGL_FUNC(glDrawElementsInstanced)
+            INIT_BACKENDGL_FUNC(glMultiDrawArrays)
+            INIT_BACKENDGL_FUNC(glMultiDrawElements)
+            INIT_BACKENDGL_FUNC(glMultiDrawArraysEXT)
+            INIT_BACKENDGL_FUNC(glMultiDrawElementsEXT)
+            INIT_BACKENDGL_FUNC(glMultiDrawElementsBaseVertex)
             INIT_BACKENDGL_FUNC(glFenceSync)
             INIT_BACKENDGL_FUNC(glIsSync)
             INIT_BACKENDGL_FUNC(glDeleteSync)
@@ -415,6 +420,7 @@ namespace SFPEW::Utils::BackendLoader {
             INIT_BACKENDGL_FUNC(glTexBufferRange)
             INIT_BACKENDGL_FUNC(glTexStorage3DMultisample)
             INIT_BACKENDGL_FUNC(glMapBufferRange)
+            INIT_BACKENDGL_FUNC(glBufferStorage)
             INIT_BACKENDGL_FUNC(glBufferStorageEXT)
             INIT_BACKENDGL_FUNC(glGetQueryObjectivEXT)
             INIT_BACKENDGL_FUNC(glGetQueryObjecti64vEXT)
@@ -499,19 +505,23 @@ namespace SFPEW::Utils::BackendLoader {
             return false;
         }
 
-        auto* vendorName = glFuncs.glGetString(GL_VENDOR);
-        auto* gpuName = glFuncs.glGetString(GL_RENDERER);
-        glFuncs.glGetIntegerv(GL_MAJOR_VERSION, (GLint*)caps.Version[0]);
-        glFuncs.glGetIntegerv(GL_MINOR_VERSION, (GLint*)caps.Version[1]);
+        // glGetString returns null without a current context; never feed
+        // that into std::string.
+        auto safeString = [](const GLubyte* s) {
+            return s ? std::string(reinterpret_cast<const char*>(s)) : std::string{};
+        };
 
-        caps.VersionString = std::string((char*)glFuncs.glGetString(GL_VERSION));
-        caps.RendererString = std::string((char*)gpuName);
-        caps.VendorString = std::string((char*)vendorName);
-        caps.ShadingLanguageVersionString = std::string((char*)glFuncs.glGetString(GL_SHADING_LANGUAGE_VERSION));
+        glFuncs.glGetIntegerv(GL_MAJOR_VERSION, (GLint*)&caps.Version[0]);
+        glFuncs.glGetIntegerv(GL_MINOR_VERSION, (GLint*)&caps.Version[1]);
+
+        caps.VersionString = safeString(glFuncs.glGetString(GL_VERSION));
+        caps.RendererString = safeString(glFuncs.glGetString(GL_RENDERER));
+        caps.VendorString = safeString(glFuncs.glGetString(GL_VENDOR));
+        caps.ShadingLanguageVersionString = safeString(glFuncs.glGetString(GL_SHADING_LANGUAGE_VERSION));
 
         GLint extCount = 0;
         glFuncs.glGetIntegerv(GL_NUM_EXTENSIONS, &extCount);
-        for (GLint i = 0; i < extCount; ++i) {
+        for (GLint i = 0; glFuncs.glGetStringi && i < extCount; ++i) {
             const char* extension = (const char*)glFuncs.glGetStringi(GL_EXTENSIONS, i);
             if (extension) {
                 if (std::strcmp(extension, "GL_EXT_buffer_storage") == 0) {
