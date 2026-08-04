@@ -8,6 +8,10 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3 -pipe -integrated-as -mllvm -polly -mllvm -polly-vectorizer=stripmine -mllvm -polly-invariant-load-hoisting -mllvm -polly-run-inliner -mllvm -polly-run-dce -mllvm -polly-invariant-load-hoisting -flto -mllvm -polly-run-inliner -mllvm -polly-run-dce -fwhole-program-vtables -fdata-sections -ffunction-sections -fmerge-all-constants -mllvm -polly-detect-keep-going -mllvm -polly-ast-use-context -march=armv8-a+simd -fvisibility=hidden -Wall -Wextra -ferror-limit=0 -Wno-return-type -Wno-unused-parameter -Wno-c++98-compat -Wno-c++98-compat-pedantic -DGLM_FORCE_INTRINSICS -Wno-unicode-whitespace -Wno-format -Wno-unused-function -DUseFastSTL -DUseJEMALLOC -pthread")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -pipe -integrated-as -mllvm -polly -mllvm -polly-vectorizer=stripmine -mllvm -polly-invariant-load-hoisting -mllvm -polly-run-inliner -mllvm -polly-run-dce -mllvm -polly-invariant-load-hoisting -flto -mllvm -polly-run-inliner -mllvm -polly-run-dce -fwhole-program-vtables -fdata-sections -ffunction-sections -fmerge-all-constants -mllvm -polly-detect-keep-going -mllvm -polly-ast-use-context -march=armv8-a+simd -fvisibility=hidden -Wall -Wextra -ferror-limit=0 -Wno-return-type -Wno-unused-parameter -Wno-c++98-compat -Wno-c++98-compat-pedantic -DGLM_FORCE_INTRINSICS -stdlib=libc++ -Wno-unicode-whitespace -Wno-format -Wno-unused-function -Wno-vla-cxx-extension -DUseFastSTL -frtti -DUseJEMALLOC -pthread")
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fuse-ld=lld -flto -O3 -Wl,--strip-all -fvisibility=hidden -Wl,-O3 -Wl,--gc-sections -Wl,--as-needed -static-libstdc++")
+
 # Executables are linked -static-libstdc++ below so one can run away from the
 # toolchain that built it. That needs the static library to exist, which it
 # does not on every machine able to build the wrapper - and until the test
@@ -28,8 +32,6 @@ else()
         # so an unoptimized C++ build dominates frame time on Android.  Keep
         # debug information while compiling the native hot path as optimized
         # production code.
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fvisibility=hidden -fno-semantic-interposition -funwind-tables -g -O3 -fno-math-errno -DNDEBUG -D_THREAD_SAFE -fPIC")
-        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g -std=gnu99 -funwind-tables -O3 -fvisibility=hidden")
         if(SFPEW_LIBSTDCXX_STATIC)
                 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static-libstdc++")
         endif()
@@ -43,43 +45,6 @@ endif()
 # LTO is for release/shipping builds; iterative test builds link the
 # 18MB+ glslang-included library far faster without it (-DSFPEW_LTO=OFF).
 option(SFPEW_LTO "Enable link-time optimization" ON)
-if(SFPEW_LTO)
-        # ThinLTO is Clang-specific; GCC only understands full LTO.
-        if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-                set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -flto=thin")
-                set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -flto=thin")
-        else()
-                set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -flto")
-                set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -flto")
-        endif()
-        # These flags reach every target, so glslang's and SPIRV-Cross's
-        # static libraries are archives of LTO bitcode - which plain `ar`
-        # can only index through a bfd plugin whose LLVM/GCC version must
-        # match the compiler's. Ubuntu ships that plugin under a versioned
-        # name (LLVMgold-18.so) and no unversioned llvm-ar, so CMake falls
-        # back to /usr/bin/ar and a mismatched or missing plugin yields an
-        # archive with an EMPTY symbol index: the linker pulls in no member,
-        # a shared library links anyway (undefined symbols are legal there),
-        # and the .so only fails at dlopen. CMAKE_<LANG>_COMPILER_AR is the
-        # archiver shipped with this exact compiler - version-matched by
-        # construction and needing no plugin at all.
-        if(CMAKE_CXX_COMPILER_AR AND CMAKE_CXX_COMPILER_RANLIB)
-                set(CMAKE_AR "${CMAKE_CXX_COMPILER_AR}")
-                set(CMAKE_RANLIB "${CMAKE_CXX_COMPILER_RANLIB}")
-        else()
-                # No archiver that is certain to handle this compiler's
-                # bitcode. Losing LTO is a slower library; guessing wrong
-                # is a library that only fails at dlopen.
-                message(WARNING "SFPEW: no LTO-capable archiver for ${CMAKE_CXX_COMPILER_ID} "
-                                "(CMAKE_CXX_COMPILER_AR unset) - building without LTO.")
-                set(SFPEW_LTO OFF)
-                string(REPLACE " -flto=thin" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
-                string(REPLACE " -flto" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
-                string(REPLACE " -flto=thin" "" CMAKE_SHARED_LINKER_FLAGS
-                       "${CMAKE_SHARED_LINKER_FLAGS}")
-                string(REPLACE " -flto" "" CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS}")
-        endif()
-endif()
 
 # GLSL 1.10/1.20 -> ESSL 3.00 translation toolchain (plans/09):
 # custom preprocessor + glslang -> SPIR-V -> SPIRV-Cross -> ESSL.
