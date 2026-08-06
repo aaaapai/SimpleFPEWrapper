@@ -12,6 +12,7 @@
 #include "fpe/imaging.h"
 #include <vector>
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include "fpe/fpe.hpp"
@@ -221,28 +222,105 @@ void glDrawBuffer(GLenum buf) {
         if (attachment) {
             GLint maximum = 0;
             g_glFuncs.glGetIntegerv(GL_MAX_COLOR_ATTACHMENTS, &maximum);
-            if (maximum <= 0 || static_cast<GLint>(buf - GL_COLOR_ATTACHMENT0) >= maximum) {
+            const GLint index = static_cast<GLint>(buf - GL_COLOR_ATTACHMENT0);
+            if (maximum <= 0 || index >= maximum) {
                 gs.set_error(GL_INVALID_OPERATION);
                 return;
             }
+            // GLES3 requires bufs[i] to be GL_NONE or GL_COLOR_ATTACHMENTi -
+            // positional, unlike desktop GL, which accepts any valid
+            // attachment token at any array position. A one-element {buf}
+            // array (the fallback below) is only legal here when buf is
+            // already GL_COLOR_ATTACHMENT0; anything past that needs every
+            // earlier slot explicitly disabled with GL_NONE.
+            std::vector<GLenum> buffers(static_cast<size_t>(index) + 1, GL_NONE);
+            buffers[static_cast<size_t>(index)] = buf;
+            g_glFuncs.glDrawBuffers(static_cast<GLsizei>(buffers.size()), buffers.data());
+            return;
         }
     }
     g_glFuncs.glDrawBuffers(1, &mapped);
 }
 
-// ES 3.0 has only the unsigned spelling. Prefer the exact EXT function when
-// available; otherwise read the common unsigned form and saturate rather than
-// wrapping a large occlusion result into a negative GLint.
+// defects-plan-2.md 2.1: glReadBuffer was entirely unwrapped - not in
+// lookup.cpp's GETPROC table and absent from this file, so
+// eglGetProcAddress("glReadBuffer") fell through to the backend's own
+// address (both floors have it natively as ES 3.0/GL 3.2 core), bypassing
+// LIST_RECORD and every other wrapper-side barrier. Mirrors glDrawBuffer
+// above almost exactly, checking the read-framebuffer binding instead of
+// the draw one. One real difference from glDrawBuffer: GL_FRONT_AND_BACK
+// is legal to draw into but illegal to read from ("not a single buffer",
+// GL 2.1 spec 4.3.1) - isLegacyDrawBuffer alone isn't enough, so that one
+// value gets an explicit carve-out.
+void glReadBuffer(GLenum src) {
+    auto& gs = g_glstate;
+    LIST_RECORD(glReadBuffer, {}, src)
+    if (rejectDuringBeginEnd(gs)) return;
+
+    // GL_FRONT_AND_BACK is a recognized legacy selector - just not a legal
+    // one to read from - so it must set GL_INVALID_OPERATION, not fall into
+    // the "not a selector GL knows at all" GL_INVALID_ENUM bucket below.
+    if (src == GL_FRONT_AND_BACK) {
+        gs.set_error(GL_INVALID_OPERATION);
+        return;
+    }
+    const bool legacy = isLegacyDrawBuffer(src);
+    const bool auxiliary = isAuxDrawBuffer(src);
+    const bool attachment = isColorAttachment(src);
+    if (src != GL_NONE && !legacy && !auxiliary && !attachment) {
+        gs.set_error(GL_INVALID_ENUM);
+        return;
+    }
+
+    sfpewEntryBarrier();
+    if (!sfpewEnsureBackend() || g_glFuncs.glReadBuffer == nullptr ||
+        g_glFuncs.glGetIntegerv == nullptr) {
+        return;
+    }
+
+    GLint framebuffer = 0;
+    g_glFuncs.glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &framebuffer);
+    GLenum mapped = src;
+    if (framebuffer == 0) {
+        if (attachment || auxiliary) {
+            gs.set_error(GL_INVALID_OPERATION);
+            return;
+        }
+        if (legacy) mapped = GL_BACK;
+    } else {
+        if (legacy || auxiliary) {
+            gs.set_error(GL_INVALID_OPERATION);
+            return;
+        }
+        if (attachment) {
+            GLint maximum = 0;
+            g_glFuncs.glGetIntegerv(GL_MAX_COLOR_ATTACHMENTS, &maximum);
+            if (maximum <= 0 || static_cast<GLint>(src - GL_COLOR_ATTACHMENT0) >= maximum) {
+                gs.set_error(GL_INVALID_OPERATION);
+                return;
+            }
+        }
+    }
+    g_glFuncs.glReadBuffer(mapped);
+}
+
+// Neither backend's *EXT signed/64-bit accessor pointer can be trusted by
+// non-nullness alone: no GLES extension defines glGetQueryObject{i,i64,ui64}
+// vEXT at all (a GLES driver handing back a non-null pointer for one anyway
+// is a documented-legal driver quirk, not a capability signal - EGL/GLES
+// allow eglGetProcAddress to return non-null for unsupported names), and
+// desktop's own GL_EXT_occlusion_query glGetQueryObjectivEXT - which does
+// legitimately exist as a real entry point - measured on this machine's own
+// desktop driver to silently never mark GL_QUERY_RESULT_AVAILABLE either.
+// The core unsigned glGetQueryObjectuiv (ES 3.0 core, and desktop GL 1.5+
+// core) is the only accessor confirmed reliable on both backends, so always
+// read through it and convert/saturate for the signed/64-bit callers.
 void glGetQueryObjectiv(GLuint id, GLenum pname, GLint* params) {
     if (params == nullptr) return;
     auto& gs = g_glstate;
     if (rejectDuringBeginEnd(gs)) return;
     sfpewEntryBarrier();
     if (!sfpewEnsureBackend() || !validateQueryObject(gs, id, pname)) return;
-    if (g_glFuncs.glGetQueryObjectivEXT != nullptr) {
-        g_glFuncs.glGetQueryObjectivEXT(id, pname, params);
-        return;
-    }
     if (g_glFuncs.glGetQueryObjectuiv == nullptr) return;
     GLuint value = 0;
     g_glFuncs.glGetQueryObjectuiv(id, pname, &value);
@@ -257,10 +335,6 @@ void glGetQueryObjecti64v(GLuint id, GLenum pname, GLint64* params) {
     if (rejectDuringBeginEnd(gs)) return;
     sfpewEntryBarrier();
     if (!sfpewEnsureBackend() || !validateQueryObject(gs, id, pname)) return;
-    if (g_glFuncs.glGetQueryObjecti64vEXT != nullptr) {
-        g_glFuncs.glGetQueryObjecti64vEXT(id, pname, params);
-        return;
-    }
     if (g_glFuncs.glGetQueryObjectuiv == nullptr) return;
     GLuint value = 0;
     g_glFuncs.glGetQueryObjectuiv(id, pname, &value);
@@ -273,21 +347,25 @@ void glGetQueryObjectui64v(GLuint id, GLenum pname, GLuint64* params) {
     if (rejectDuringBeginEnd(gs)) return;
     sfpewEntryBarrier();
     if (!sfpewEnsureBackend() || !validateQueryObject(gs, id, pname)) return;
-    if (g_glFuncs.glGetQueryObjectui64vEXT != nullptr) {
-        g_glFuncs.glGetQueryObjectui64vEXT(id, pname, params);
-        return;
-    }
     if (g_glFuncs.glGetQueryObjectuiv == nullptr) return;
     GLuint value = 0;
     g_glFuncs.glGetQueryObjectuiv(id, pname, &value);
     *params = static_cast<GLuint64>(value);
 }
-// glDrawElements lives in drawing.cpp: it is FPE-converted, not passthrough.
+// glDrawElements lives in fpe/draw_now.cpp: it is FPE-converted, not passthrough.
 void glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type,
                   GLvoid* pixels) {
     if (!sfpewEnsureBackend() || g_glFuncs.glReadPixels == nullptr) return;
     sfpewEntryBarrier();
-    if (sfpewImagingReadPixels(x, y, width, height, format, type, pixels)) return;
+    // defects-plan-3.md: full GL 2.1 3.6.3 pixel transfer for color reads
+    // (scale/bias/map, then whatever ARB_imaging stages are active -
+    // supersedes sfpewImagingReadPixels, which only ever ran the second
+    // half); GL_DEPTH_SCALE/BIAS for depth reads. Both return false
+    // (nothing to do) whenever the corresponding transfer sits at its
+    // default no-op values - the overwhelmingly common case - so the raw
+    // passthrough below stays exactly as it always was for that case.
+    if (sfpewFullColorReadPixels(x, y, width, height, format, type, pixels)) return;
+    if (sfpewDepthPixelTransferReadPixels(x, y, width, height, format, type, pixels)) return;
     // Desktop apps read GL_BGRA, which GLES3 core does not offer: read RGBA
     // and swap in place (tight rows, the common screenshot/AWT case). A
     // desktop GL backend reads it directly.
@@ -329,7 +407,7 @@ void glUseProgram(GLuint program) {
 // shadow lets glPushAttrib(GL_COLOR_BUFFER_BIT) restore it (legacy
 // Minecraft brackets GUI and item rendering that way, and a leaked blend
 // function corrupts every later translucent draw).
-// Blend, colour mask, depth range, hint, pixel store and texture parameters
+// Blend, color mask, depth range, hint, pixel store and texture parameters
 // take the flush-only barrier: all of them are server or CPU state that
 // neither reads nor writes the program, VAO or buffer bindings, and a
 // renderer changes blending and texture filtering between draws constantly.
@@ -505,6 +583,21 @@ GLint compatibleTextureParameter(GLenum pname, GLint param) {
     return isTextureWrapParameter(pname) && param == GL_CLAMP ? GL_CLAMP_TO_EDGE : param;
 }
 
+// True when this call needs border-clamp support the real backend may not
+// have: GL_TEXTURE_BORDER_COLOR unconditionally (the pname itself does not
+// exist without the extension), or a wrap parameter being set to
+// GL_CLAMP_TO_BORDER. wrapValue is ignored for the GL_TEXTURE_BORDER_COLOR
+// case, so callers that only reach this for that pname may pass 0.
+// sfpewTextureBorderClampSupported() (init.h) is the actual backend probe -
+// shared with getter_version_strings.cpp, which uses the same answer to decide whether
+// GL_ARB_texture_border_clamp belongs in the advertised extension string.
+bool rejectsAsUnsupportedBorderClamp(GLenum pname, GLint wrapValue) {
+    const bool usesBorderClamp =
+        pname == GL_TEXTURE_BORDER_COLOR ||
+        (isTextureWrapParameter(pname) && wrapValue == GL_CLAMP_TO_BORDER);
+    return usesBorderClamp && !sfpewTextureBorderClampSupported();
+}
+
 // GL_GENERATE_MIPMAP (GL 1.4): tracked per bound texture object; TexImage
 // uploads regenerate the chain via the ES3 glGenerateMipmap.
 bool sfpewHandleGenerateMipmapParam(GLenum target, GLenum pname, GLint param) {
@@ -514,13 +607,133 @@ bool sfpewHandleGenerateMipmapParam(GLenum target, GLenum pname, GLint param) {
     return true;
 }
 
+// GL_ARB_shadow's GL_TEXTURE_COMPARE_MODE is, unlike GL_TEXTURE_PRIORITY and
+// GL_DEPTH_TEXTURE_MODE above, a real GLES3/GL-core enum the backend already
+// accepts and stores itself (a shadow sampler's hardware comparison depends
+// on the driver having it) - so this only ever mirrors it into
+// texture_compare_mode for glstate.cpp's program_hash() resync, and never
+// swallows the call: every caller below still falls through to the ordinary
+// passthrough beneath it. GL_TEXTURE_COMPARE_FUNC needs no such mirror -
+// nothing but the driver ever consults it - so it takes no special path at
+// all.
+void sfpewRecordTextureCompareMode(GLenum target, GLenum pname, GLint param) {
+    if (pname != GL_TEXTURE_COMPARE_MODE) return;
+    if (target == GL_TEXTURE_1D) target = GL_TEXTURE_2D;
+    if (!validTextureParameterTarget(target)) return;
+    g_glstate.texture_compare_mode[sfpewLogicalTextureBinding(target)] = static_cast<GLenum>(param);
+}
+
 } // namespace
+
+namespace {
+
+// Duplicated from texture_binding.cpp (which owns the logical texture-binding
+// shadow that sfpewLogicalTextureBinding et al. maintain, using this same
+// switch to map a target onto its GL_TEXTURE_BINDING_* query enum) rather
+// than exposed cross-TU: validTextureGetParameterTarget below only needs the
+// "is this target bindable" question, and this switch is small enough that a
+// second copy is simpler than a new export for it.
+GLenum textureBindingQuery(GLenum target) {
+    switch (target) {
+    case GL_TEXTURE_2D:
+        return GL_TEXTURE_BINDING_2D;
+    case GL_TEXTURE_CUBE_MAP:
+        return GL_TEXTURE_BINDING_CUBE_MAP;
+#ifdef GL_TEXTURE_3D
+    case GL_TEXTURE_3D:
+        return GL_TEXTURE_BINDING_3D;
+#endif
+#ifdef GL_TEXTURE_2D_ARRAY
+    case GL_TEXTURE_2D_ARRAY:
+        return GL_TEXTURE_BINDING_2D_ARRAY;
+#endif
+    default:
+        return GL_NONE;
+    }
+}
+
+// Renamed from its original "validTextureParameterTarget" when the texture
+// getters moved here: this file already has its own (differently-scoped, setter-side)
+// validTextureParameterTarget above accepting only TEXTURE_1D/2D/3D/CUBE_MAP,
+// and both would otherwise collide in this translation unit's single
+// anonymous namespace. Kept verbatim otherwise - this getter-side check also
+// accepts GL_TEXTURE_2D_ARRAY, unlike the setter-side one; that pre-existing
+// discrepancy was not introduced by this move.
+bool validTextureGetParameterTarget(GLenum target) {
+    if (target == GL_TEXTURE_1D) return true;
+    return textureBindingQuery(target) != GL_NONE;
+}
+
+GLenum textureParameterTarget(GLenum target) {
+    return target == GL_TEXTURE_1D ? GL_TEXTURE_2D : target;
+}
+
+GLclampf texturePriority(GLuint texture) {
+    const auto& priorities = g_glstate_c.texture_priorities;
+    const auto it = priorities.find(texture);
+    return it == priorities.end() ? 1.0f : it->second;
+}
+
+GLenum depthTextureMode(GLuint texture) {
+    const auto& modes = g_glstate_c.texture_depth_mode;
+    const auto it = modes.find(texture);
+    return it == modes.end() ? GL_LUMINANCE : it->second;
+}
+
+} // namespace
+
+void glGetTexParameterfv(GLenum target, GLenum pname, GLfloat* params) {
+    auto& gs = g_glstate;
+    if (params == nullptr) return;
+    if (pname == GL_TEXTURE_PRIORITY || pname == GL_TEXTURE_RESIDENT || pname == GL_DEPTH_TEXTURE_MODE) {
+        if (!validTextureGetParameterTarget(target)) {
+            gs.set_error(GL_INVALID_ENUM);
+            return;
+        }
+        sfpewEntryBarrier();
+        if (pname == GL_TEXTURE_PRIORITY)
+            params[0] = texturePriority(sfpewLogicalTextureBinding(textureParameterTarget(target)));
+        else if (pname == GL_DEPTH_TEXTURE_MODE)
+            params[0] = static_cast<GLfloat>(depthTextureMode(sfpewLogicalTextureBinding(textureParameterTarget(target))));
+        else
+            params[0] = 1.0f; // all live and default textures are reported resident
+        return;
+    }
+    if (!sfpewEnsureBackend() || g_glFuncs.glGetTexParameterfv == nullptr) return;
+    sfpewEntryBarrier();
+    g_glFuncs.glGetTexParameterfv(textureParameterTarget(target), pname, params);
+}
+
+void glGetTexParameteriv(GLenum target, GLenum pname, GLint* params) {
+    auto& gs = g_glstate;
+    if (params == nullptr) return;
+    if (pname == GL_TEXTURE_PRIORITY || pname == GL_TEXTURE_RESIDENT || pname == GL_DEPTH_TEXTURE_MODE) {
+        if (!validTextureGetParameterTarget(target)) {
+            gs.set_error(GL_INVALID_ENUM);
+            return;
+        }
+        sfpewEntryBarrier();
+        if (pname == GL_TEXTURE_PRIORITY) {
+            const GLfloat value = texturePriority(sfpewLogicalTextureBinding(textureParameterTarget(target)));
+            *params = static_cast<GLint>(std::lround(value));
+        } else if (pname == GL_DEPTH_TEXTURE_MODE) {
+            *params = static_cast<GLint>(depthTextureMode(sfpewLogicalTextureBinding(textureParameterTarget(target))));
+        } else {
+            *params = GL_TRUE;
+        }
+        return;
+    }
+    if (!sfpewEnsureBackend() || g_glFuncs.glGetTexParameteriv == nullptr) return;
+    sfpewEntryBarrier();
+    g_glFuncs.glGetTexParameteriv(textureParameterTarget(target), pname, params);
+}
 
 void glTexParameterf(GLenum target, GLenum pname, GLfloat param) {
     auto& gs = g_glstate;
     sfpewClientStateBarrier();
     LIST_RECORD(glTexParameterf, {}, target, pname, param)
     if (sfpewHandleGenerateMipmapParam(target, pname, (GLint)param)) return;
+    sfpewRecordTextureCompareMode(target, pname, static_cast<GLint>(param));
     if (pname == GL_TEXTURE_PRIORITY) {
         if (target == GL_TEXTURE_1D) target = GL_TEXTURE_2D;
         if (!validTextureParameterTarget(target)) {
@@ -530,8 +743,23 @@ void glTexParameterf(GLenum target, GLenum pname, GLfloat param) {
         gs.texture_priorities[sfpewLogicalTextureBinding(target)] = std::clamp(param, 0.0f, 1.0f);
         return;
     }
+    if (pname == GL_DEPTH_TEXTURE_MODE) {
+        if (target == GL_TEXTURE_1D) target = GL_TEXTURE_2D;
+        if (!validTextureParameterTarget(target)) {
+            gs.set_error(GL_INVALID_ENUM);
+            return;
+        }
+        const GLuint texture = sfpewLogicalTextureBinding(target);
+        gs.texture_depth_mode[texture] = static_cast<GLenum>(param);
+        sfpewApplyDepthTextureModeSwizzle(target, texture);
+        return;
+    }
     if (target == GL_TEXTURE_1D) target = GL_TEXTURE_2D;
     if (g_glFuncs.glTexParameterf == nullptr) return;
+    if (rejectsAsUnsupportedBorderClamp(pname, static_cast<GLint>(param))) {
+        gs.set_error(GL_INVALID_ENUM);
+        return;
+    }
     if (isTextureWrapParameter(pname) && static_cast<GLint>(param) == GL_CLAMP)
         param = static_cast<GLfloat>(GL_CLAMP_TO_EDGE);
     g_glFuncs.glTexParameterf(target, pname, param);
@@ -544,6 +772,7 @@ void glTexParameterfv(GLenum target, GLenum pname, const GLfloat* params) {
     LIST_RECORD(glTexParameterfv,
                 {{2, (pname == GL_TEXTURE_BORDER_COLOR ? 4u : 1u) * sizeof(GLfloat)}}, target, pname,
                 params)
+    sfpewRecordTextureCompareMode(target, pname, static_cast<GLint>(params[0]));
     if (pname == GL_TEXTURE_PRIORITY) {
         if (target == GL_TEXTURE_1D) target = GL_TEXTURE_2D;
         if (!validTextureParameterTarget(target)) {
@@ -553,8 +782,23 @@ void glTexParameterfv(GLenum target, GLenum pname, const GLfloat* params) {
         gs.texture_priorities[sfpewLogicalTextureBinding(target)] = std::clamp(params[0], 0.0f, 1.0f);
         return;
     }
+    if (pname == GL_DEPTH_TEXTURE_MODE) {
+        if (target == GL_TEXTURE_1D) target = GL_TEXTURE_2D;
+        if (!validTextureParameterTarget(target)) {
+            gs.set_error(GL_INVALID_ENUM);
+            return;
+        }
+        const GLuint texture = sfpewLogicalTextureBinding(target);
+        gs.texture_depth_mode[texture] = static_cast<GLenum>(params[0]);
+        sfpewApplyDepthTextureModeSwizzle(target, texture);
+        return;
+    }
     if (target == GL_TEXTURE_1D) target = GL_TEXTURE_2D;
     if (g_glFuncs.glTexParameterfv == nullptr) return;
+    if (rejectsAsUnsupportedBorderClamp(pname, static_cast<GLint>(params[0]))) {
+        gs.set_error(GL_INVALID_ENUM);
+        return;
+    }
     if (isTextureWrapParameter(pname) && static_cast<GLint>(params[0]) == GL_CLAMP) {
         const GLfloat compatible = static_cast<GLfloat>(GL_CLAMP_TO_EDGE);
         g_glFuncs.glTexParameterfv(target, pname, &compatible);
@@ -568,6 +812,7 @@ void glTexParameteri(GLenum target, GLenum pname, GLint param) {
     sfpewClientStateBarrier();
     LIST_RECORD(glTexParameteri, {}, target, pname, param)
     if (sfpewHandleGenerateMipmapParam(target, pname, param)) return;
+    sfpewRecordTextureCompareMode(target, pname, param);
     if (pname == GL_TEXTURE_PRIORITY) {
         if (target == GL_TEXTURE_1D) target = GL_TEXTURE_2D;
         if (!validTextureParameterTarget(target)) {
@@ -578,9 +823,24 @@ void glTexParameteri(GLenum target, GLenum pname, GLint param) {
             std::clamp(static_cast<GLfloat>(param), 0.0f, 1.0f);
         return;
     }
+    if (pname == GL_DEPTH_TEXTURE_MODE) {
+        if (target == GL_TEXTURE_1D) target = GL_TEXTURE_2D;
+        if (!validTextureParameterTarget(target)) {
+            gs.set_error(GL_INVALID_ENUM);
+            return;
+        }
+        const GLuint texture = sfpewLogicalTextureBinding(target);
+        gs.texture_depth_mode[texture] = static_cast<GLenum>(param);
+        sfpewApplyDepthTextureModeSwizzle(target, texture);
+        return;
+    }
     if (target == GL_TEXTURE_1D) target = GL_TEXTURE_2D;
-    if (g_glFuncs.glTexParameteri != nullptr)
-        g_glFuncs.glTexParameteri(target, pname, compatibleTextureParameter(pname, param));
+    if (g_glFuncs.glTexParameteri == nullptr) return;
+    if (rejectsAsUnsupportedBorderClamp(pname, param)) {
+        gs.set_error(GL_INVALID_ENUM);
+        return;
+    }
+    g_glFuncs.glTexParameteri(target, pname, compatibleTextureParameter(pname, param));
 }
 
 void glTexParameteriv(GLenum target, GLenum pname, const GLint* params) {
@@ -590,6 +850,7 @@ void glTexParameteriv(GLenum target, GLenum pname, const GLint* params) {
     LIST_RECORD(glTexParameteriv,
                 {{2, (pname == GL_TEXTURE_BORDER_COLOR ? 4u : 1u) * sizeof(GLint)}}, target, pname,
                 params)
+    sfpewRecordTextureCompareMode(target, pname, params[0]);
     if (pname == GL_TEXTURE_PRIORITY) {
         if (target == GL_TEXTURE_1D) target = GL_TEXTURE_2D;
         if (!validTextureParameterTarget(target)) {
@@ -600,8 +861,23 @@ void glTexParameteriv(GLenum target, GLenum pname, const GLint* params) {
             std::clamp(static_cast<GLfloat>(params[0]), 0.0f, 1.0f);
         return;
     }
+    if (pname == GL_DEPTH_TEXTURE_MODE) {
+        if (target == GL_TEXTURE_1D) target = GL_TEXTURE_2D;
+        if (!validTextureParameterTarget(target)) {
+            gs.set_error(GL_INVALID_ENUM);
+            return;
+        }
+        const GLuint texture = sfpewLogicalTextureBinding(target);
+        gs.texture_depth_mode[texture] = static_cast<GLenum>(params[0]);
+        sfpewApplyDepthTextureModeSwizzle(target, texture);
+        return;
+    }
     if (target == GL_TEXTURE_1D) target = GL_TEXTURE_2D;
     if (g_glFuncs.glTexParameteriv == nullptr) return;
+    if (rejectsAsUnsupportedBorderClamp(pname, params[0])) {
+        gs.set_error(GL_INVALID_ENUM);
+        return;
+    }
     if (isTextureWrapParameter(pname) && params[0] == GL_CLAMP) {
         const GLint compatible = GL_CLAMP_TO_EDGE;
         g_glFuncs.glTexParameteriv(target, pname, &compatible);
@@ -642,7 +918,7 @@ void glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, G
     }
     // Legacy formats must match the RED/RG storage glTexImage2D allocated
     // for them; BGRA is swapped on the CPU (tight rows assumed, mirroring
-    // the allocation path in getter.cpp).
+    // the allocation path in texture_image.cpp).
     if (format == GL_ALPHA || format == GL_LUMINANCE) {
         format = GL_RED;
     } else if (format == GL_LUMINANCE_ALPHA) {

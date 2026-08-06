@@ -62,6 +62,28 @@ void restore_depth_stencil_scissor(const fixed_function_state_t::backend_state_s
 bool sfpewUserProgramAttribLocations(GLuint program, GLint out_locations[VERTEX_POINTER_COUNT]);
 bool gather_client_arrays(const vertex_pointer_array_t& raw, GLint first, GLsizei count,
                           vertex_pointer_array_t* out);
+
+// Ground-truth classification of a draw's enabled vertex attributes: whether
+// their `gl*Pointer` data source is real client memory, one shared VBO, or a
+// mix of the two/several VBOs - read from client_array_buffer_bindings[]
+// (types.h, populated by rememberClientArrayBufferBinding at every gl*Pointer
+// call) rather than guessed from the `pointer` value's magnitude, which
+// cannot tell a real address from a small buffer offset (plans/13).
+enum class client_array_kind_t { all_client_memory, single_buffer, mixed };
+client_array_kind_t classifyClientArrays(const vertex_pointer_array_t& raw, GLuint* out_buffer_id);
+
+// `mixed` counterpart to gather_client_arrays (plans/13 13.4): some enabled
+// attributes are real client memory, others are byte offsets into a bound
+// VBO (the same buffer for more than one, or several different ones) - no
+// single glVertexAttribPointer/glBindBuffer pair can express that, so every
+// attribute's bytes are read to the CPU individually (buffer-backed ones via
+// a synchronous glMapBufferRange readback) and interleaved into the same
+// gathered-buffer shape gather_client_arrays produces, so it flows through
+// the identical downstream ring-upload path. False on failure (draw should
+// be dropped, not fallen back on - the old pointer-magnitude heuristic this
+// replaces is gone).
+bool gather_mixed_client_arrays(const vertex_pointer_array_t& raw, GLint first, GLsizei count,
+                                vertex_pointer_array_t* out);
 void sfpewSendUserProgramAttributes(const GLint locations[VERTEX_POINTER_COUNT],
                                     const vertex_pointer_array_t& va, GLintptr binding_offset);
 // Full fixed-function-arrays draw through a user program. Returns true
@@ -337,6 +359,22 @@ struct fpe_backend_draw_state_guard_t {
 
     fpe_backend_draw_state_guard_t(const fpe_backend_draw_state_guard_t&) = delete;
     fpe_backend_draw_state_guard_t& operator=(const fpe_backend_draw_state_guard_t&) = delete;
+};
+
+struct array_buffer_binding_guard_t {
+    GLint binding = 0;
+
+    array_buffer_binding_guard_t() { g_glFuncs.glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &binding); }
+
+    ~array_buffer_binding_guard_t() {
+        g_glFuncs.glBindBuffer(GL_ARRAY_BUFFER, binding);
+        // The restore changed the backend binding underneath the immediate
+        // arm; cold path, so a plain invalidate keeps the invariant simple.
+        sfpewInvalidateImmediateDrawState();
+    }
+
+    array_buffer_binding_guard_t(const array_buffer_binding_guard_t&) = delete;
+    array_buffer_binding_guard_t& operator=(const array_buffer_binding_guard_t&) = delete;
 };
 
 // -1 - FPE unavailable, 0 - keep DrawArrays, 1 - switch to DrawElements

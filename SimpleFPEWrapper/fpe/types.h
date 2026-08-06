@@ -224,6 +224,23 @@ struct fixed_function_bool_t {      // glEnable/glDisable
     // glEnable(GL_TEXTURE_GEN_S/T/R/Q) per unit; [unit][coord], coord order
     // S,T,R,Q. Shader consumption is the second half of plans/05 5.2.
     bool texture_gen_enable[MAX_TEX][4] = {};
+    // defects-plan-2.md 2.2/2.4: GL_POINT_SPRITE itself, GL_COORD_REPLACE
+    // per unit (a glTexEnv(GL_POINT_SPRITE, ...) parameter targeting the
+    // currently active unit, same indexing as texture_env_mode), and
+    // GL_POINT_SMOOTH. All three only affect fragments the shader can
+    // identify as belonging to a GL_POINTS draw at runtime (see
+    // IsPointPrimitive in fpe_shadergen.cpp) - the uber-shader is not
+    // primitive-keyed, so none of this can be a compile-time branch.
+    bool point_sprite_enable = false;
+    bool point_sprite_coord_replace[MAX_TEX] = {false};
+    bool point_smooth_enable = false;
+    // GL_ARB_shadow: unit i samples a depth texture with
+    // GL_TEXTURE_COMPARE_MODE == GL_COMPARE_R_TO_TEXTURE, so the generated
+    // shader must declare Sampler{i} as sampler2DShadow and pass the R
+    // texcoord as the reference depth instead of returning the raw depth.
+    // Derived from per-texture-object state at the top of program_hash()
+    // (glstate.cpp) - see resync_texture_shadow_sample().
+    bool texture_shadow_sample[MAX_TEX] = {false};
 };
 
 struct light_t {
@@ -415,7 +432,7 @@ struct fixed_function_state_t {
     color_buffer_state_t color_buffer;                // blend / masks (for attrib stack)
     // glLogicOp: stored so GL_LOGIC_OP_MODE reads back exactly what was set,
     // but GL_COLOR_LOGIC_OP/GL_INDEX_LOGIC_OP never actually enable per
-    // spec's meaning of those caps - see getter.cpp and state.cpp for why
+    // spec's meaning of those caps - see ffp_state_query.cpp and state.cpp for why
     // (ES 3.0 core has no fixed-function logic op, no extension-free way to
     // read the destination color in a fragment shader on that floor either).
     GLenum logic_op_mode = GL_COPY;
@@ -683,6 +700,7 @@ struct program_uniform_locations_t {
     GLint sampler[MAX_TEX] = {};
     GLint texture_matrix[MAX_TEX] = {};
     GLint texture_env_color[MAX_TEX] = {};
+    GLint lod_bias[MAX_TEX] = {};
     GLint texgen_obj_planes[MAX_TEX] = {};
     GLint texgen_eye_planes[MAX_TEX] = {};
     GLint clip_planes[6] = {};
@@ -697,6 +715,9 @@ struct program_uniform_locations_t {
     GLint point_size_min = -1;
     GLint point_size_max = -1;
     GLint point_distance_attenuation = -1;
+    GLint point_fade_threshold = -1;
+    GLint is_point_primitive = -1;
+    GLint point_sprite_lower_left_origin = -1;
     bool initialized = false;
 
     void initialize(GLuint program);
@@ -720,6 +741,7 @@ struct program_uniform_values_t {
     glm::vec4 light_spot_params[MAX_LIGHTS]{};   // x = cos(cutoff) or -2, y = exponent
     glm::mat4 texture_matrix[MAX_TEX]{};
     glm::vec4 texture_env_color[MAX_TEX]{};
+    GLfloat lod_bias[MAX_TEX]{};
     glm::vec4 texgen_obj_planes[MAX_TEX][4]{};
     glm::vec4 texgen_eye_planes[MAX_TEX][4]{};
     glm::vec4 clip_planes[6]{};
@@ -736,6 +758,13 @@ struct program_uniform_values_t {
     GLfloat point_size_min = 0.0f;
     GLfloat point_size_max = 1.0f;
     glm::vec3 point_distance_attenuation = {1.0f, 0.0f, 0.0f};
+    GLfloat point_fade_threshold = 1.0f;
+    // Not floats/bools cached bitwise-identically to a shadow default; see
+    // the "-1 means never uploaded" sentinel these two use in send_uniforms
+    // (an ordinary bool default of false would look identical to "already
+    // uploaded false" on the very first draw of a program).
+    GLint is_point_primitive = -1;
+    GLint point_sprite_lower_left_origin = -1;
     bool initialized = false;
 };
 
@@ -827,7 +856,7 @@ struct program_hash_cache_t {
 };
 
 // The subset of a texture environment the shader generator bakes into its
-// source. The environment colour and LOD bias are excluded on purpose: they
+// source. The environment color and LOD bias are excluded on purpose: they
 // reach the shader as uniforms, so changing them must not mint a new program.
 inline program_hash_cache_t::combiner_signature_t sfpewCombinerSignature(const texture_env_t& env) {
     program_hash_cache_t::combiner_signature_t out;
@@ -896,6 +925,21 @@ struct glstate_t {
     // backend floor. Keep the priority per texture name so the legacy
     // queries remain observable; absent entries use the specified default 1.
     unordered_map<GLuint, GLclampf> texture_priorities;
+
+    // GL_ARB_depth_texture's legacy GL_DEPTH_TEXTURE_MODE, kept per texture
+    // name the same way texture_priorities is; absent entries use the
+    // specified default GL_LUMINANCE.
+    unordered_map<GLuint, GLenum> texture_depth_mode;
+
+    // GL_ARB_shadow's GL_TEXTURE_COMPARE_MODE, kept per texture name for the
+    // same reason: program_hash()'s resync needs it every draw to decide
+    // fixed_function_bool_t::texture_shadow_sample, and doing that via a live
+    // glGetTexParameter round trip per unit per draw would be real cost for
+    // no benefit - GL_TEXTURE_COMPARE_MODE and _FUNC are otherwise real
+    // GLES3/GL-core enums the backend already stores and answers itself, so
+    // GL_TEXTURE_COMPARE_FUNC has no mirror here; nothing but the driver ever
+    // needs it. Absent entries use the specified default GL_NONE.
+    unordered_map<GLuint, GLenum> texture_compare_mode;
 
     // Selection / feedback (plans/10 10.3). CPU transform results only;
     // nothing reaches the GPU while render_mode != GL_RENDER.
@@ -1061,6 +1105,13 @@ struct glstate_t {
 
     void send_uniforms(program_t& program);
 
+    // GL_ARB_shadow: derives fpe_bools.texture_shadow_sample[i] for every
+    // unit from the real texture bound there and that object's
+    // texture_compare_mode. Called at the top of program_hash(), the single
+    // point both draw paths converge, so the shader-visible booleans are
+    // always current before the hash/cache key is built from them.
+    void resync_texture_shadow_sample();
+
     program_key_t program_hash();
 
     program_t& get_or_generate_program(const program_key_t& key);
@@ -1178,7 +1229,7 @@ inline glstate_t& sfpewVertexDataState() {
     // lands on the no-context state, and vertices arriving after the app then
     // makes one current must resolve strictly (and be dropped by the
     // primitive == kNoPrimitive guard) exactly like the pre-snapshot
-    // behaviour.
+    // behavior.
     glstate_t* const state = tls_snapshot_state;
     if (state != nullptr && state->fpe_state.fpe_draw.primitive != kNoPrimitive &&
         tls_snapshot_context != nullptr) {

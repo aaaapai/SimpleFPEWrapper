@@ -77,6 +77,13 @@ void tex_env_set_int(glstate_t& gs, GLenum target, GLenum pname, GLint param) {
         current_texture_env(gs).lod_bias = (GLfloat)param;
         return;
     }
+    // defects-plan-2.md 2.2: glTexEnv(GL_POINT_SPRITE, GL_COORD_REPLACE, ...)
+    // targets the currently active unit, same indexing as every other
+    // per-unit texture-env parameter.
+    if (target == GL_POINT_SPRITE && pname == GL_COORD_REPLACE) {
+        gs.fpe_state.fpe_bools.point_sprite_coord_replace[active_texture_index()] = param != 0;
+        return;
+    }
     if (target != GL_TEXTURE_ENV) return;
 
     auto& env = current_texture_env(gs);
@@ -319,6 +326,13 @@ bool hijack_fpe_states(GLenum cap, bool enable, fixed_function_bool_t* bools) {
     case GL_COLOR_SUM:
         bools->color_sum_enable = enable;
         return true;
+    // defects-plan-2.md 2.2/2.4.
+    case GL_POINT_SPRITE:
+        bools->point_sprite_enable = enable;
+        return true;
+    case GL_POINT_SMOOTH:
+        bools->point_smooth_enable = enable;
+        return true;
     default:
         break;
     }
@@ -429,6 +443,15 @@ void glClientActiveTexture(GLenum texture) {
 
     // Todo: this function can be added to displayList when GL 1.3+ is disabled
 
+    // Unvalidated, client_active_texture would reach vp2idx() unclamped and
+    // index straight past attributes[VERTEX_POINTER_COUNT] on an out-of-range
+    // enum - matching the bounds check DEFINE_MULTITEXCOORD below already
+    // applies to its own unit argument.
+    if (texture < GL_TEXTURE0 || texture - GL_TEXTURE0 >= MAX_TEX) {
+        g_glstate.set_error(GL_INVALID_ENUM);
+        return;
+    }
+
     auto& gs = g_glstate;
     gs.fpe_state.client_active_texture = texture;
 }
@@ -525,7 +548,7 @@ void glAlphaFunc(GLenum func, GLclampf ref) {
 // can execute does not get a real implementation (see how texture
 // residency/priorities are handled - real, honest state tracking with no
 // forwarded rendering effect). GL_COLOR_LOGIC_OP/GL_INDEX_LOGIC_OP
-// deliberately keep reporting disabled in getter.cpp for the same reason:
+// deliberately keep reporting disabled in ffp_state_query.cpp for the same reason:
 // enabling them would advertise a render effect that is not present.
 void glLogicOp(GLenum opcode) {
     sfpewClientStateBarrier();
@@ -840,6 +863,64 @@ void glLightiv(GLenum light, GLenum pname, const GLint* params) {
     }
 }
 
+void glGetLightfv(GLenum light, GLenum pname, GLfloat* params) {
+    if (!params) return;
+    auto& gs = g_glstate;
+    if (light < GL_LIGHT0 || light >= GL_LIGHT0 + MAX_LIGHTS) {
+        gs.set_error(GL_INVALID_ENUM);
+        return;
+    }
+    const auto& l = gs.fpe_uniform.lights[light - GL_LIGHT0];
+    switch (pname) {
+    case GL_AMBIENT:
+        memcpy(params, glm::value_ptr(l.ambient), 4 * sizeof(GLfloat));
+        break;
+    case GL_DIFFUSE:
+        memcpy(params, glm::value_ptr(l.diffuse), 4 * sizeof(GLfloat));
+        break;
+    case GL_SPECULAR:
+        memcpy(params, glm::value_ptr(l.specular), 4 * sizeof(GLfloat));
+        break;
+    case GL_POSITION:
+        // Stored in eye coordinates (transformed at call time), which is
+        // exactly what GetLight returns per spec.
+        memcpy(params, glm::value_ptr(l.position), 4 * sizeof(GLfloat));
+        break;
+    case GL_SPOT_DIRECTION:
+        memcpy(params, glm::value_ptr(l.spot_direction), 3 * sizeof(GLfloat));
+        break;
+    case GL_SPOT_EXPONENT:
+        params[0] = l.spot_exp;
+        break;
+    case GL_SPOT_CUTOFF:
+        params[0] = l.spot_cutoff;
+        break;
+    case GL_CONSTANT_ATTENUATION:
+        params[0] = l.constant_attenuation;
+        break;
+    case GL_LINEAR_ATTENUATION:
+        params[0] = l.linear_attenuation;
+        break;
+    case GL_QUADRATIC_ATTENUATION:
+        params[0] = l.quadratic_attenuation;
+        break;
+    default:
+        gs.set_error(GL_INVALID_ENUM);
+        break;
+    }
+}
+
+void glGetLightiv(GLenum light, GLenum pname, GLint* params) {
+    if (!params) return;
+    GLfloat staging[4] = {};
+    glGetLightfv(light, pname, staging);
+    const int count = (pname == GL_AMBIENT || pname == GL_DIFFUSE || pname == GL_SPECULAR ||
+                       pname == GL_POSITION)
+                          ? 4
+                          : (pname == GL_SPOT_DIRECTION ? 3 : 1);
+    for (int i = 0; i < count; ++i) params[i] = static_cast<GLint>(staging[i]);
+}
+
 void glLightModelf(GLenum pname, GLfloat param) {
     sfpewClientStateBarrier();
     // LOG()
@@ -1026,6 +1107,48 @@ void glMaterialiv(GLenum face, GLenum pname, const GLint* params) {
     SELF_CALL(glMaterialfv, face, pname, converted)
 }
 
+void glGetMaterialfv(GLenum face, GLenum pname, GLfloat* params) {
+    if (!params) return;
+    auto& gs = g_glstate;
+    // GL_FRONT_AND_BACK is valid for setting but not for querying.
+    if (face != GL_FRONT && face != GL_BACK) {
+        gs.set_error(GL_INVALID_ENUM);
+        return;
+    }
+    const auto& material = gs.fpe_uniform.materials[face == GL_FRONT ? 0 : 1];
+    switch (pname) {
+    case GL_AMBIENT:
+        memcpy(params, glm::value_ptr(material.ambient), 4 * sizeof(GLfloat));
+        break;
+    case GL_DIFFUSE:
+        memcpy(params, glm::value_ptr(material.diffuse), 4 * sizeof(GLfloat));
+        break;
+    case GL_SPECULAR:
+        memcpy(params, glm::value_ptr(material.specular), 4 * sizeof(GLfloat));
+        break;
+    case GL_EMISSION:
+        memcpy(params, glm::value_ptr(material.emission), 4 * sizeof(GLfloat));
+        break;
+    case GL_SHININESS:
+        params[0] = material.shininess;
+        break;
+    case GL_COLOR_INDEXES:
+        memcpy(params, glm::value_ptr(material.color_indexes), 3 * sizeof(GLfloat));
+        break;
+    default:
+        gs.set_error(GL_INVALID_ENUM);
+        break;
+    }
+}
+
+void glGetMaterialiv(GLenum face, GLenum pname, GLint* params) {
+    if (!params) return;
+    GLfloat staging[4] = {};
+    glGetMaterialfv(face, pname, staging);
+    const int count = pname == GL_SHININESS ? 1 : (pname == GL_COLOR_INDEXES ? 3 : 4);
+    for (int i = 0; i < count; ++i) params[i] = static_cast<GLint>(staging[i]);
+}
+
 void glTexEnvf(GLenum target, GLenum pname, GLfloat param) {
     sfpewClientStateBarrier();
     LIST_RECORD(glTexEnvf, {}, target, pname, param)
@@ -1034,6 +1157,10 @@ void glTexEnvf(GLenum target, GLenum pname, GLfloat param) {
     auto& env = current_texture_env(gs);
     if (target == GL_TEXTURE_FILTER_CONTROL && pname == GL_TEXTURE_LOD_BIAS) {
         env.lod_bias = param;
+        return;
+    }
+    if (target == GL_POINT_SPRITE) {
+        tex_env_set_int(gs, target, pname, (GLint)param);
         return;
     }
     if (target != GL_TEXTURE_ENV) return;
@@ -1074,6 +1201,10 @@ void glTexEnvfv(GLenum target, GLenum pname, const GLfloat* params) {
         env.lod_bias = param;
         return;
     }
+    if (target == GL_POINT_SPRITE) {
+        tex_env_set_int(gs, target, pname, (GLint)param);
+        return;
+    }
     if (target != GL_TEXTURE_ENV) return;
     switch (pname) {
     case GL_RGB_SCALE:
@@ -1101,6 +1232,73 @@ void glTexEnviv(GLenum target, GLenum pname, const GLint* params) {
         return;
     }
     tex_env_set_int(gs, target, pname, params[0]);
+}
+
+void glGetTexEnvfv(GLenum target, GLenum pname, GLfloat* params) {
+    if (!params) return;
+    auto& gs = g_glstate;
+    const int unit = std::clamp(static_cast<int>(sfpewLogicalActiveTexture() - GL_TEXTURE0), 0, MAX_TEX - 1);
+    // defects-plan-2.md 2.2.
+    if (target == GL_POINT_SPRITE && pname == GL_COORD_REPLACE) {
+        params[0] = gs.fpe_state.fpe_bools.point_sprite_coord_replace[unit] ? 1.0f : 0.0f;
+        return;
+    }
+    if (target != GL_TEXTURE_ENV) {
+        gs.set_error(GL_INVALID_ENUM);
+        return;
+    }
+    const auto& env = gs.fpe_uniform.texture_env[unit];
+    switch (pname) {
+    case GL_TEXTURE_ENV_MODE:
+        params[0] = static_cast<GLfloat>(env.mode);
+        break;
+    case GL_TEXTURE_ENV_COLOR:
+        memcpy(params, glm::value_ptr(env.color), 4 * sizeof(GLfloat));
+        break;
+    case GL_COMBINE_RGB:
+        params[0] = static_cast<GLfloat>(env.combine_rgb);
+        break;
+    case GL_COMBINE_ALPHA:
+        params[0] = static_cast<GLfloat>(env.combine_alpha);
+        break;
+    case GL_SRC0_RGB:
+    case GL_SRC1_RGB:
+    case GL_SRC2_RGB:
+        params[0] = static_cast<GLfloat>(env.source_rgb[pname - GL_SRC0_RGB]);
+        break;
+    case GL_SRC0_ALPHA:
+    case GL_SRC1_ALPHA:
+    case GL_SRC2_ALPHA:
+        params[0] = static_cast<GLfloat>(env.source_alpha[pname - GL_SRC0_ALPHA]);
+        break;
+    case GL_OPERAND0_RGB:
+    case GL_OPERAND1_RGB:
+    case GL_OPERAND2_RGB:
+        params[0] = static_cast<GLfloat>(env.operand_rgb[pname - GL_OPERAND0_RGB]);
+        break;
+    case GL_OPERAND0_ALPHA:
+    case GL_OPERAND1_ALPHA:
+    case GL_OPERAND2_ALPHA:
+        params[0] = static_cast<GLfloat>(env.operand_alpha[pname - GL_OPERAND0_ALPHA]);
+        break;
+    case GL_RGB_SCALE:
+        params[0] = env.rgb_scale;
+        break;
+    case GL_ALPHA_SCALE:
+        params[0] = env.alpha_scale;
+        break;
+    default:
+        gs.set_error(GL_INVALID_ENUM);
+        break;
+    }
+}
+
+void glGetTexEnviv(GLenum target, GLenum pname, GLint* params) {
+    if (!params) return;
+    GLfloat staging[4] = {};
+    glGetTexEnvfv(target, pname, staging);
+    const int count = pname == GL_TEXTURE_ENV_COLOR ? 4 : 1;
+    for (int i = 0; i < count; ++i) params[i] = static_cast<GLint>(staging[i]);
 }
 
 // The original implementation only defined a few GLfloat scalar immediate-mode
@@ -1489,6 +1687,59 @@ void glTexGendv(GLenum coord, GLenum pname, const GLdouble* params) {
     SELF_CALL(glTexGenfv, coord, pname, converted)
 }
 
+namespace {
+int texgenCoordIndex(GLenum coord) {
+    switch (coord) {
+    case GL_S: return 0;
+    case GL_T: return 1;
+    case GL_R: return 2;
+    case GL_Q: return 3;
+    default: return -1;
+    }
+}
+} // namespace
+
+void glGetTexGenfv(GLenum coord, GLenum pname, GLfloat* params) {
+    if (!params) return;
+    auto& gs = g_glstate;
+    const int c = texgenCoordIndex(coord);
+    if (c < 0) {
+        gs.set_error(GL_INVALID_ENUM);
+        return;
+    }
+    const int unit = std::clamp(static_cast<int>(sfpewLogicalActiveTexture() - GL_TEXTURE0), 0, MAX_TEX - 1);
+    switch (pname) {
+    case GL_TEXTURE_GEN_MODE:
+        params[0] = static_cast<GLfloat>(gs.fpe_state.texture_gen_mode[unit][c]);
+        break;
+    case GL_OBJECT_PLANE:
+        memcpy(params, glm::value_ptr(gs.fpe_uniform.texgen_object_plane[unit][c]), 4 * sizeof(GLfloat));
+        break;
+    case GL_EYE_PLANE:
+        memcpy(params, glm::value_ptr(gs.fpe_uniform.texgen_eye_plane[unit][c]), 4 * sizeof(GLfloat));
+        break;
+    default:
+        gs.set_error(GL_INVALID_ENUM);
+        break;
+    }
+}
+
+void glGetTexGeniv(GLenum coord, GLenum pname, GLint* params) {
+    if (!params) return;
+    GLfloat staging[4] = {};
+    glGetTexGenfv(coord, pname, staging);
+    const int count = pname == GL_TEXTURE_GEN_MODE ? 1 : 4;
+    for (int i = 0; i < count; ++i) params[i] = static_cast<GLint>(staging[i]);
+}
+
+void glGetTexGendv(GLenum coord, GLenum pname, GLdouble* params) {
+    if (!params) return;
+    GLfloat staging[4] = {};
+    glGetTexGenfv(coord, pname, staging);
+    const int count = pname == GL_TEXTURE_GEN_MODE ? 1 : 4;
+    for (int i = 0; i < count; ++i) params[i] = static_cast<GLdouble>(staging[i]);
+}
+
 void glPixelZoom(GLfloat xfactor, GLfloat yfactor) {
     sfpewClientStateBarrier();
     LIST_RECORD(glPixelZoom, {}, xfactor, yfactor)
@@ -1759,8 +2010,8 @@ void glPointParameterfv(GLenum pname, const GLfloat* params) {
             gs.set_error(GL_INVALID_VALUE);
             return;
         }
-        // The threshold is tracked exactly, but alpha fading remains outside
-        // this group's minimum rendering scope; distance sizing is real below.
+        // defects-plan-2.md 2.3: alpha fading below this threshold is real,
+        // see vPointFadeAlpha in fpe_shadergen.cpp.
         uniform.point_fade_threshold_size = params[0];
         break;
     case GL_POINT_DISTANCE_ATTENUATION:

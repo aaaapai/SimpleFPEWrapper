@@ -80,20 +80,27 @@ add_subdirectory(3rdparty/SPIRV-Cross EXCLUDE_FROM_ALL)
 
 add_library(${CMAKE_PROJECT_NAME} SHARED
         SimpleFPEWrapper/init.cpp
-        SimpleFPEWrapper/drawing.cpp
-        SimpleFPEWrapper/getter.cpp
+        SimpleFPEWrapper/multidraw.cpp
+        SimpleFPEWrapper/getter_version_strings.cpp
         SimpleFPEWrapper/fbo.cpp
+        SimpleFPEWrapper/texture_binding.cpp
+        SimpleFPEWrapper/texture_image.cpp
         SimpleFPEWrapper/lookup.cpp
         SimpleFPEWrapper/ordered_passthrough.cpp
 
         SimpleFPEWrapper/backend/loader.cpp
+        SimpleFPEWrapper/backend/capabilities.cpp
 
         SimpleFPEWrapper/fpe/fpe.cpp
         SimpleFPEWrapper/fpe/fpe_shadergen.cpp
         SimpleFPEWrapper/fpe/state.cpp
+        SimpleFPEWrapper/fpe/ffp_state_query.cpp
         SimpleFPEWrapper/fpe/transformation.cpp
         SimpleFPEWrapper/fpe/vertexpointer.cpp
         SimpleFPEWrapper/fpe/list.cpp
+        SimpleFPEWrapper/fpe/list_diagnostics.cpp
+        SimpleFPEWrapper/fpe/list_capture.cpp
+        SimpleFPEWrapper/fpe/draw_now.cpp
         SimpleFPEWrapper/fpe/attribstack.cpp
         SimpleFPEWrapper/fpe/pixelops.cpp
         SimpleFPEWrapper/fpe/linestipple.cpp
@@ -126,22 +133,30 @@ endif()
 # The git commit this build came from, reported alongside the version in
 # GL_VERSION and logged once at initialization, so a device report always
 # identifies the code it was produced by - a version cannot distinguish two
-# builds made the same day. Configure time is good enough: the hash marks the
-# checkout. The bare hash is the whole stamp; a working-tree state marker
-# does not belong in a string users read and quote. Falls back to "unknown"
-# outside a git checkout (tarball builds).
-find_package(Git QUIET)
-set(SFPEW_GIT_COMMIT "unknown")
-if(GIT_FOUND)
-        execute_process(COMMAND ${GIT_EXECUTABLE} -C ${CMAKE_SOURCE_DIR} rev-parse --short=12 HEAD
-                        OUTPUT_VARIABLE SFPEW_GIT_COMMIT_RAW
-                        OUTPUT_STRIP_TRAILING_WHITESPACE
-                        ERROR_QUIET RESULT_VARIABLE SFPEW_GIT_RC)
-        if(SFPEW_GIT_RC EQUAL 0)
-                set(SFPEW_GIT_COMMIT "${SFPEW_GIT_COMMIT_RAW}")
-        endif()
-endif()
-target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE SFPEW_GIT_COMMIT="${SFPEW_GIT_COMMIT}")
+# builds made the same day. The bare hash is the whole stamp; a working-tree
+# state marker does not belong in a string users read and quote.
+#
+# A plain execute_process() here only runs when CMake itself is
+# reconfigured, not on an ordinary `ninja`/`make` rebuild - a commit made
+# between configures would report stale. Instead this regenerates a small
+# header via an `ALL` custom target, which (having no OUTPUT-based
+# dependency tracking of its own) reruns its COMMAND on every build
+# invocation unconditionally; the script only touches the header's mtime
+# when the commit actually changed, so this cannot force a full rebuild.
+# version.h picks the header up via __has_include with its own existing
+# "unknown" fallback (outside a git checkout, e.g. a tarball build);
+# fpe/list_diagnostics.cpp, the other direct consumer, now includes version.h
+# for the same reason.
+set(SFPEW_GIT_COMMIT_HEADER "${CMAKE_BINARY_DIR}/generated/sfpew_git_commit.h")
+add_custom_target(sfpew_git_commit ALL
+        COMMAND ${CMAKE_COMMAND} -D SRC_DIR=${CMAKE_SOURCE_DIR}
+                                 -D OUT_FILE=${SFPEW_GIT_COMMIT_HEADER}
+                                 -P ${CMAKE_SOURCE_DIR}/tools/generate_git_commit.cmake
+        BYPRODUCTS ${SFPEW_GIT_COMMIT_HEADER}
+        COMMENT "Refreshing git commit hash"
+)
+add_dependencies(${CMAKE_PROJECT_NAME} sfpew_git_commit)
+target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${CMAKE_BINARY_DIR}/generated)
 
 # A shared library may legally carry undefined symbols, so a link that
 # quietly dropped a static-library member (a bitcode archive the archiver
@@ -251,7 +266,7 @@ if(NOT ANDROID)
                 # process. That is fine within one backend and wrong across
                 # them; ctest is the supported way to run these.
 
-                # Migrated suites. Each file is one area of behaviour; the
+                # Migrated suites. Each file is one area of behavior; the
                 # backend a case needs is chosen by its fixture. These need no
                 # driver at all - the wrapper's own bookkeeping.
                 foreach(suite load error display_list_cpu)
@@ -297,7 +312,14 @@ if(NOT ANDROID)
                                        imaging_color_table imaging_convolution
                                        imaging_histogram_minmax imaging_pipeline
                                        pushattrib_depth_stencil_scissor getteximage_3d_cube
-                                       color_sum logicop line_stipple texture_3d_cube)
+                                       color_sum logicop line_stipple texture_3d_cube
+                                       read_buffer point_sprite texgen_cube
+                                       drawpixels_stencil pixel_transfer_readback lod_bias
+                                       depth_texture_mode texture_shadow
+                                       texture_anisotropic texture_compressed_2d
+                                       texture_border_clamp occlusion_query
+                                       texture_env_crossbar multitexture_unit_validation
+                                       client_state_validation client_buffer_classification)
                                 sfpew_add_gtest(sfpew_${suite}_test SOURCES tests/gtest_${suite}.cc
                                                 LIBRARIES ${SFPEW_TEST_EGL})
                         endforeach()

@@ -1103,11 +1103,22 @@ const char* glEnumToString(GLenum e) {
     }
 }
 
+// GLSL ES only predeclares a default fragment-shader precision for
+// sampler2D/samplerCube (lowp) - sampler3D (texture_target_kind_t::tex3d)
+// and sampler2DShadow (GL_ARB_shadow's texture_shadow_sample units) have
+// none, and a shader declaring one without an explicit precision statement
+// is a compile error, not a silently-assumed default. Some drivers
+// (checked against this project's own dev/CI split, both times: sampler3D
+// first, then sampler2DShadow the same way when GL_ARB_shadow added it)
+// tolerate the omission anyway; GLES spec-conformant ones correctly refuse
+// to compile with "No precision specified in this scope for type `...'".
 constexpr std::string_view mg_shader_header = "#version 300 es\n"
                                                "// MobileGlues FPE Shader\n"
                                                "#ifdef GL_ES\n"
                                                "precision highp float;\n"
                                                "precision highp int;\n"
+                                               "precision highp sampler3D;\n"
+                                               "precision highp sampler2DShadow;\n"
                                                "#endif\n";
 constexpr std::string_view mg_vs_header = "// ** Vertex Shader **\n";
 constexpr std::string_view mg_fs_header = "// ** Fragment Shader **\n";
@@ -1241,12 +1252,14 @@ int texture_unit_from_attribute(int attribute_index) {
 
 
 // Declared in fpe_shadergen.h (shared with glstate.cpp). Deliberately NOT
-// consulted by unit_uses_texgen/texgen_needs_eye/texgen_needs_normal below -
-// texture coordinate generation composed with a 3D or cube target
-// (GL_REFLECTION_MAP/GL_NORMAL_MAP's natural use, ironically) is a known,
-// documented gap, not silently wrong: those three functions still gate on
-// texture_2d_enable only, so texgen never activates for a 3D/cube unit and
-// the plain vertex texcoord attribute is sampled instead.
+// consulted by unit_uses_texgen/texgen_needs_eye/texgen_needs_normal below,
+// which also gate on it (defects-plan-2.md 2.6) - GL_REFLECTION_MAP and
+// GL_NORMAL_MAP already produce a full 3-component eye-space vector
+// (tgR{i} below), which is exactly a cube map's natural sample coordinate
+// (ARB_texture_cube_map's whole reason to exist), so once these three
+// functions stopped gating on texture_2d_enable alone the existing codegen
+// needed no further change to feed it: the needs_3_component swizzle in
+// add_fs_body already picks .xyz for a 3D/cube target.
 texture_target_kind_t active_texture_target(const fixed_function_state_t& state, int unit) {
     if (state.fpe_bools.texture_cube_enable[unit]) return texture_target_kind_t::cube;
     if (state.fpe_bools.texture_3d_enable[unit]) return texture_target_kind_t::tex3d;
@@ -1256,7 +1269,7 @@ texture_target_kind_t active_texture_target(const fixed_function_state_t& state,
 
 // Any texgen coordinate live on a textured unit?
 bool unit_uses_texgen(const fixed_function_state_t& state, int unit) {
-    if (!state.fpe_bools.texture_2d_enable[unit]) return false;
+    if (active_texture_target(state, unit) == texture_target_kind_t::none) return false;
     for (int c = 0; c < 4; ++c)
         if (state.fpe_bools.texture_gen_enable[unit][c]) return true;
     return false;
@@ -1277,7 +1290,7 @@ bool any_texgen(const fixed_function_state_t& state) {
 // Do any live texgen coords need eye-space data / the normal?
 bool texgen_needs_eye(const fixed_function_state_t& state) {
     for (int i = 0; i < MAX_TEX; ++i) {
-        if (!state.fpe_bools.texture_2d_enable[i]) continue;
+        if (active_texture_target(state, i) == texture_target_kind_t::none) continue;
         for (int c = 0; c < 4; ++c) {
             if (!state.fpe_bools.texture_gen_enable[i][c]) continue;
             const GLenum mode = state.texture_gen_mode[i][c];
@@ -1291,7 +1304,7 @@ bool texgen_needs_eye(const fixed_function_state_t& state) {
 
 bool texgen_needs_normal(const fixed_function_state_t& state) {
     for (int i = 0; i < MAX_TEX; ++i) {
-        if (!state.fpe_bools.texture_2d_enable[i]) continue;
+        if (active_texture_target(state, i) == texture_target_kind_t::none) continue;
         for (int c = 0; c < 4; ++c) {
             if (!state.fpe_bools.texture_gen_enable[i][c]) continue;
             const GLenum mode = state.texture_gen_mode[i][c];
@@ -1300,6 +1313,27 @@ bool texgen_needs_normal(const fixed_function_state_t& state) {
         }
     }
     return false;
+}
+
+// defects-plan-2.md 2.2/2.3/2.4: whether the fragment shader needs to know
+// at runtime if the current draw is actually GL_POINTS. The uber-shader is
+// not primitive-keyed (no separate program variant per primitive type), so
+// point sprite coord replacement, point smoothing, and point size fade are
+// all gated on this uniform rather than a compile-time branch - a program
+// built while GL_POINTS happened to be current must behave identically for
+// a later GL_TRIANGLES draw with the same enables.
+bool needs_is_point_primitive(const fixed_function_state_t& state) {
+    return state.point_attenuation_active || state.fpe_bools.point_sprite_enable ||
+           state.fpe_bools.point_smooth_enable;
+}
+
+bool unit_has_point_sprite_replace(const fixed_function_state_t& state, int unit) {
+    return state.fpe_bools.point_sprite_enable && state.fpe_bools.point_sprite_coord_replace[unit] &&
+           active_texture_target(state, unit) == texture_target_kind_t::tex2d &&
+           // GL_COORD_REPLACE substitutes an (s,t) pair; a shadow-sampled
+           // unit's coordinate is (s,t,ref) into a comparison sampler that
+           // gl_PointCoord has no reference-depth component for.
+           !state.fpe_bools.texture_shadow_sample[unit];
 }
 
 void add_vs_inout(const fixed_function_state_t& state, scratch_t& scratch, std::string& vs) {
@@ -1427,6 +1461,15 @@ void add_vs_inout(const fixed_function_state_t& state, scratch_t& scratch, std::
         vs += std::format("out float vClipDistance{};\n", i);
         scratch.last_stage_linkage += std::format("in float vClipDistance{};\n", i);
     }
+    // defects-plan-2.md 2.3: GL_POINT_FADE_THRESHOLD_SIZE only has a
+    // rendering effect alongside distance attenuation (spec 3.3 - the fade
+    // ratio is computed from the same pre-clamp derived size attenuation
+    // produces), so this rides point_attenuation_active rather than its own
+    // enable.
+    if (state.point_attenuation_active) {
+        vs += "out float vPointFadeAlpha;\n";
+        scratch.last_stage_linkage += "in float vPointFadeAlpha;\n";
+    }
 }
 
 void add_vs_uniforms(const fixed_function_state_t& state, scratch_t& scratch, std::string& vs) {
@@ -1436,7 +1479,8 @@ void add_vs_uniforms(const fixed_function_state_t& state, scratch_t& scratch, st
     if (state.point_attenuation_active) {
         vs += "uniform float PointSizeMin;\n"
               "uniform float PointSizeMax;\n"
-              "uniform vec3 PointDistanceAttenuation;\n";
+              "uniform vec3 PointDistanceAttenuation;\n"
+              "uniform float PointFadeThreshold;\n";
     }
     if (state.fpe_bools.fog_enable || state.fpe_bools.lighting_enable || texgen_needs_eye(state) ||
         any_clip_plane(state) || state.point_attenuation_active) {
@@ -1588,7 +1632,12 @@ void add_vs_body(const fixed_function_state_t& state, scratch_t& scratch, std::s
               "        PointDistanceAttenuation.y * pointDistance +\n"
               "        PointDistanceAttenuation.z * pointDistance * pointDistance;\n"
               "    float derivedPointSize = PointSize * inversesqrt(max(pointAttenuation, 1e-6));\n"
-              "    gl_PointSize = clamp(derivedPointSize, PointSizeMin, PointSizeMax);\n";
+              "    gl_PointSize = clamp(derivedPointSize, PointSizeMin, PointSizeMax);\n"
+              // GL 2.1 spec 3.3: alpha scales by (derivedSize/threshold)^2
+              // only while the pre-clamp derived size is below the
+              // threshold; at or above it the point is unfaded.
+              "    float pointFadeRatio = derivedPointSize / max(PointFadeThreshold, 1e-6);\n"
+              "    vPointFadeAlpha = pointFadeRatio < 1.0 ? clamp(pointFadeRatio * pointFadeRatio, 0.0, 1.0) : 1.0;\n";
     } else {
         vs += "    gl_PointSize = PointSize;\n";
     }
@@ -1692,13 +1741,17 @@ void add_vs_body(const fixed_function_state_t& state, scratch_t& scratch, std::s
 
 void add_fs_uniforms(const fixed_function_state_t& state, [[maybe_unused]] scratch_t& scratch, std::string& fs) {
     if (state.fpe_bools.polygon_stipple_enable) fs += "uniform uint PolygonStipple[32];\n";
+    if (needs_is_point_primitive(state)) fs += "uniform bool IsPointPrimitive;\n";
+    if (state.fpe_bools.point_sprite_enable) fs += "uniform bool PointSpriteLowerLeftOrigin;\n";
     for (int i = 0; i < MAX_TEX; ++i) {
         const auto target = active_texture_target(state, i);
         if (target == texture_target_kind_t::none) continue;
         const char* sampler_type = target == texture_target_kind_t::cube    ? "samplerCube"
                                    : target == texture_target_kind_t::tex3d ? "sampler3D"
-                                                                            : "sampler2D";
+                                   : state.fpe_bools.texture_shadow_sample[i] ? "sampler2DShadow"
+                                                                              : "sampler2D";
         fs += std::format("uniform {} Sampler{};\n", sampler_type, i);
+        fs += std::format("uniform float LodBias{};\n", i);
         if (state.texture_env_mode[i] == GL_BLEND || state.texture_env_mode[i] == GL_COMBINE) {
             fs += std::format("uniform vec4 TexEnvColor{};\n", i);
         }
@@ -1726,8 +1779,12 @@ void add_fs_inout(const fixed_function_state_t& state, scratch_t& scratch, std::
 }
 
 // GL_COMBINE argument expression: source selection x operand mapping.
-// `unit` is the combiner's unit; texcolorN may only be referenced for units
-// already sampled (ascending order), otherwise the crossbar reads black.
+// `unit` is the combiner's unit. GL_ARB_texture_env_crossbar: a
+// GL_SOURCE{0,1,2}_{RGB,ALPHA} of GL_TEXTUREn may name ANY active unit, not
+// just one earlier in iteration order - add_fs_body's sample pass runs to
+// completion for every active unit before the combine pass (this function)
+// runs for any of them, so texcolorN already exists here regardless of
+// whether n is before or after `unit`.
 std::string combine_argument(const fixed_function_state_t& state, const texture_env_t& env, int unit,
                              int arg, bool rgb_domain) {
     const GLenum source = rgb_domain ? env.source_rgb[arg] : env.source_alpha[arg];
@@ -1736,7 +1793,7 @@ std::string combine_argument(const fixed_function_state_t& state, const texture_
         src = std::format("texcolor{}", unit);
     } else if (source >= GL_TEXTURE0 && source < GL_TEXTURE0 + MAX_TEX) {
         const int n = static_cast<int>(source - GL_TEXTURE0);
-        src = (n <= unit && active_texture_target(state, n) != texture_target_kind_t::none)
+        src = active_texture_target(state, n) != texture_target_kind_t::none
                   ? std::format("texcolor{}", n)
                   : std::string("vec4(0.0)");
     } else if (source == GL_CONSTANT) {
@@ -1824,6 +1881,13 @@ void add_fs_body(const fixed_function_state_t& state, scratch_t& scratch, std::s
     else
         fs += "    vec4 color = vec4(1., 1., 1., 1.);\n";
 
+    // Pass 1: sample every active unit into texcolorN before any unit's
+    // GL_COMBINE runs (below). GL_ARB_texture_env_crossbar lets
+    // GL_SOURCE{0,1,2}_{RGB,ALPHA} name GL_TEXTUREn for ANY n, including a
+    // unit later in iteration order than the combiner's own unit - so
+    // texcolorN for every active unit must already exist by the time
+    // combine_argument() (pass 2, below) can reference it, not just the
+    // ones sampled earlier in a single interleaved loop.
     for (int i = 0; i < MAX_TEX; ++i) {
         const auto target = active_texture_target(state, i);
         if (target == texture_target_kind_t::none) continue;
@@ -1841,14 +1905,53 @@ void add_fs_body(const fixed_function_state_t& state, scratch_t& scratch, std::s
         // default 0), so no vertex-side change is needed for either arity.
         const bool needs_3_component =
             target == texture_target_kind_t::tex3d || target == texture_target_kind_t::cube;
-        const std::string coord =
+        std::string coord =
             scratch.has_texcoord[i]
                 ? std::format("texCoord{}.{}", i, needs_3_component ? "xyz" : "xy")
                 : (needs_3_component ? "vec3(0.0)" : "vec2(0.0)");
-        fs += std::format("\n"
-                          "    // Texturing #{0}\n"
-                          "    vec4 texcolor{0} = texture(Sampler{0}, {1});\n",
-                          i, coord);
+        // defects-plan-2.md 2.2: GL_POINT_SPRITE + GL_COORD_REPLACE (GL 1.4
+        // spec 3.9.1) substitutes gl_PointCoord for this unit's texcoord -
+        // only while the current draw is actually GL_POINTS, which the
+        // uber-shader can't know at compile time (see
+        // needs_is_point_primitive above), so this is a runtime select, not
+        // a different coord string outright. 2D units only: GL_COORD_REPLACE
+        // is defined in terms of an (s,t) pair, and a 3D/cube unit's third
+        // sample component has no point-sprite equivalent to replace it
+        // with (unit_has_point_sprite_replace already excludes them).
+        if (unit_has_point_sprite_replace(state, i)) {
+            coord = std::format(
+                "(IsPointPrimitive ? vec2(gl_PointCoord.x, PointSpriteLowerLeftOrigin ? "
+                "1.0 - gl_PointCoord.y : gl_PointCoord.y) : {})",
+                coord);
+        }
+        if (state.fpe_bools.texture_shadow_sample[i]) {
+            // GL 1.4/ARB_shadow: the R texcoord is the reference depth. A
+            // sampler2DShadow overload of texture() returns a plain float
+            // (the comparison result), never a vec4 - GL_DEPTH_TEXTURE_MODE's
+            // RGBA replication is invisible past that return type, so this
+            // does not attempt to honor it for a shadow-sampled unit; it
+            // always broadcasts the result across texcolor{0} the way the
+            // default GL_LUMINANCE/GL_INTENSITY modes would (the pairing
+            // every real ARB_shadow shadow map relies on).
+            const std::string ref = scratch.has_texcoord[i] ? std::format("texCoord{}.z", i)
+                                                            : std::string("0.0");
+            fs += std::format("\n"
+                              "    // Texturing #{0} (GL_ARB_shadow depth compare)\n"
+                              "    vec4 texcolor{0} = vec4(texture(Sampler{0}, vec3({1}, {2}), LodBias{0}));\n",
+                              i, coord, ref);
+        } else {
+            fs += std::format("\n"
+                              "    // Texturing #{0}\n"
+                              "    vec4 texcolor{0} = texture(Sampler{0}, {1}, LodBias{0});\n",
+                              i, coord);
+        }
+    }
+
+    // Pass 2: apply each active unit's texture-env / GL_COMBINE function in
+    // unit order, accumulating into `color`. Split from pass 1 above so a
+    // crossbar reference always finds its texcolorN already sampled.
+    for (int i = 0; i < MAX_TEX; ++i) {
+        if (active_texture_target(state, i) == texture_target_kind_t::none) continue;
 
         switch (state.texture_env_mode[i]) {
         case GL_REPLACE:
@@ -1901,16 +2004,32 @@ void add_fs_body(const fixed_function_state_t& state, scratch_t& scratch, std::s
     }
 
     // GL_COLOR_SUM (GL 1.4 / EXT_secondary_color, spec 3.9.1): the secondary
-    // colour adds into RGB only, after texturing, before fog. Alpha is
+    // color adds into RGB only, after texturing, before fog. Alpha is
     // untouched - glSecondaryColor3* has no alpha component; the spec fixes
     // it at 1.0 for exactly this reason. Guarded on has_secondary_color_input
     // too: with COLOR_SUM enabled but no glSecondaryColor3*/Pointer call
     // ever made, add_vs_inout never declares vertexSecColor at all (nothing
-    // fed attribute slot 6), and the GL default secondary colour is
+    // fed attribute slot 6), and the GL default secondary color is
     // {0,0,0,1} anyway - adding it would be a no-op, so skip the reference
     // rather than emit an undeclared identifier.
     if (state.fpe_bools.color_sum_enable && scratch.has_secondary_color_input) {
         fs += "    color.rgb += vertexSecColor.rgb;\n";
+    }
+
+    // defects-plan-2.md 2.4: GL_POINT_SMOOTH as a radial soft-edge alpha
+    // falloff - the classic point-AA approximation, and a real one (unlike
+    // GL_LINE_SMOOTH/GL_POLYGON_SMOOTH, which would need per-primitive
+    // geometry processing this wrapper's native-rasterizer draw path
+    // doesn't have, so those stay honest state with no forwarded effect).
+    if (state.fpe_bools.point_smooth_enable) {
+        fs += "    if (IsPointPrimitive) {\n"
+              "        float pointEdgeDist = length(gl_PointCoord - vec2(0.5)) * 2.0;\n"
+              "        color.a *= 1.0 - smoothstep(0.8, 1.0, pointEdgeDist);\n"
+              "    }\n";
+    }
+    // defects-plan-2.md 2.3.
+    if (state.point_attenuation_active) {
+        fs += "    if (IsPointPrimitive) color.a *= vPointFadeAlpha;\n";
     }
 
     // Alpha test: uniform-selected comparison, GL_NEVER..GL_GEQUAL encoded

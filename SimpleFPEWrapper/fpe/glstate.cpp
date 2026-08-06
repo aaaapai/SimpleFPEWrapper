@@ -49,6 +49,9 @@ void program_uniform_locations_t::initialize(GLuint program) {
     point_size_min = location("PointSizeMin");
     point_size_max = location("PointSizeMax");
     point_distance_attenuation = location("PointDistanceAttenuation");
+    point_fade_threshold = location("PointFadeThreshold");
+    is_point_primitive = location("IsPointPrimitive");
+    point_sprite_lower_left_origin = location("PointSpriteLowerLeftOrigin");
     for (int i = 0; i < 6; ++i) clip_planes[i] = location(std::format("ClipPlane{}", i));
     polygon_stipple_rows = location("PolygonStipple");
 
@@ -65,6 +68,7 @@ void program_uniform_locations_t::initialize(GLuint program) {
         sampler[i] = location(std::format("Sampler{}", i));
         texture_matrix[i] = location(std::format("TexMat{}", i));
         texture_env_color[i] = location(std::format("TexEnvColor{}", i));
+        lod_bias[i] = location(std::format("LodBias{}", i));
         texgen_obj_planes[i] = location(std::format("TexGen{}ObjPlanes", i));
         texgen_eye_planes[i] = location(std::format("TexGen{}EyePlanes", i));
     }
@@ -105,18 +109,29 @@ void glstate_t::send_uniforms(program_t& program) {
     if (model_view_changed) values.model_view = mv;
     if (projection_changed) values.projection = proj;
 
+    // NormalMat is declared (and consumed) whenever lighting needs it OR
+    // texgen_needs_normal() does (defects-plan-2.md 2.6 exposed this: a
+    // SPHERE_MAP/NORMAL_MAP/REFLECTION_MAP texgen unit with lighting OFF
+    // reads NormalMat too - see add_vs_uniforms's own `!lighting_enable &&
+    // texgen_needs_normal(state)` condition), so this upload cannot stay
+    // inside the lighting_enable block below: locations.normal was
+    // otherwise only ever populated with a value while lighting was on,
+    // leaving a texgen-only unit's NormalMat at whatever a fresh uniform
+    // defaults to (driver-dependent, typically all-zero) - a degenerate
+    // transform for every normal that unit's texgen ever generated from.
+    // Harmless no-op when the shader never declared the uniform at all:
+    // locations.normal stays -1 from glGetUniformLocation either way.
+    if (model_view_changed && locations.normal >= 0) {
+        const glm::mat3 normal_matrix = glm::inverseTranspose(glm::mat3(mv));
+        g_glFuncs.glUniformMatrix3fv(locations.normal, 1, GL_FALSE, glm::value_ptr(normal_matrix));
+    }
+
     if (fpe_state.fpe_bools.lighting_enable) {
         const auto send_vec4 = [&differs](GLint location, const glm::vec4& value, glm::vec4& previous) {
             if (!differs(value, previous)) return;
             if (location >= 0) g_glFuncs.glUniform4fv(location, 1, glm::value_ptr(value));
             previous = value;
         };
-
-        if (model_view_changed && locations.normal >= 0) {
-            const glm::mat3 normal_matrix = glm::inverseTranspose(glm::mat3(mv));
-            g_glFuncs.glUniformMatrix3fv(locations.normal, 1, GL_FALSE,
-                                         glm::value_ptr(normal_matrix));
-        }
 
         send_vec4(locations.light_model_ambient, fpe_uniform.light_model_ambient,
                   values.light_model_ambient);
@@ -200,6 +215,12 @@ void glstate_t::send_uniforms(program_t& program) {
             if (locations.texture_env_color[i] >= 0)
                 g_glFuncs.glUniform4fv(locations.texture_env_color[i], 1, glm::value_ptr(env_color));
             values.texture_env_color[i] = env_color;
+        }
+
+        const auto lod_bias = fpe_uniform.texture_env[i].lod_bias;
+        if (differs(lod_bias, values.lod_bias[i])) {
+            if (locations.lod_bias[i] >= 0) g_glFuncs.glUniform1f(locations.lod_bias[i], lod_bias);
+            values.lod_bias[i] = lod_bias;
         }
 
         if (locations.texgen_obj_planes[i] >= 0 &&
@@ -295,15 +316,60 @@ void glstate_t::send_uniforms(program_t& program) {
             }
             values.point_distance_attenuation = fpe_uniform.point_distance_attenuation;
         }
+        if ((first_upload || fpe_uniform.point_fade_threshold_size != values.point_fade_threshold) &&
+            locations.point_fade_threshold >= 0) {
+            g_glFuncs.glUniform1f(locations.point_fade_threshold, fpe_uniform.point_fade_threshold_size);
+            values.point_fade_threshold = fpe_uniform.point_fade_threshold_size;
+        }
+    }
+
+    // defects-plan-2.md 2.2/2.3/2.4: recomputed every draw, not just on
+    // state change - the same cached program can serve a GL_POINTS draw
+    // immediately followed by a GL_TRIANGLES one with everything else held
+    // constant, and IsPointPrimitive has to track that per draw call.
+    if (locations.is_point_primitive >= 0) {
+        const GLint is_point = fpe_state.fpe_draw.primitive == GL_POINTS ? 1 : 0;
+        if (first_upload || is_point != values.is_point_primitive) {
+            g_glFuncs.glUniform1i(locations.is_point_primitive, is_point);
+            values.is_point_primitive = is_point;
+        }
+    }
+    if (locations.point_sprite_lower_left_origin >= 0) {
+        const GLint lower_left = fpe_state.point_sprite_coord_origin == GL_LOWER_LEFT ? 1 : 0;
+        if (first_upload || lower_left != values.point_sprite_lower_left_origin) {
+            g_glFuncs.glUniform1i(locations.point_sprite_lower_left_origin, lower_left);
+            values.point_sprite_lower_left_origin = lower_left;
+        }
     }
 
     values.initialized = true;
+}
+
+void glstate_t::resync_texture_shadow_sample() {
+    for (int i = 0; i < MAX_TEX; ++i) {
+        bool shadow = false;
+        // Cube/3D units are out of scope for this codegen (fpe_shadergen.cpp
+        // has no shadow-cube/shadow-3D sampler arm) - a documented cut, not a
+        // silent one.
+        if (active_texture_target(fpe_state, i) == texture_target_kind_t::tex2d) {
+            const GLuint texture =
+                sfpewLogicalTextureBindingForUnit(GL_TEXTURE0 + i, GL_TEXTURE_2D);
+            const auto it = texture_compare_mode.find(texture);
+            const GLenum mode = it == texture_compare_mode.end() ? GL_NONE : it->second;
+            // GL_COMPARE_R_TO_TEXTURE (ARB_shadow) and GL_COMPARE_REF_TO_TEXTURE
+            // (core) are the same 0x884E; both spellings reach here verbatim
+            // through glTexParameter*.
+            shadow = mode == GL_COMPARE_R_TO_TEXTURE;
+        }
+        fpe_state.fpe_bools.texture_shadow_sample[i] = shadow;
+    }
 }
 
 program_key_t glstate_t::program_hash() {
     // This executes for every fixed-function draw. The caller has already
     // normalized the vertex array, so avoid two heap allocations and a second
     // normalization just to build the shader-program key.
+    resync_texture_shadow_sample();
     const auto& va = fpe_state.normalized_vpa;
     const auto& sizes = fpe_state.fpe_draw.current_data.sizes;
 

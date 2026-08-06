@@ -107,8 +107,28 @@ int sfpewLegacyHintSlot(GLenum target);
 // The two differ in which legacy queries they still accept, so anything
 // that has to pick a spelling asks here.
 bool sfpewDesktopGLVersion(int* major, int* minor);
+// GL_ARB_texture_border_clamp (GL_CLAMP_TO_BORDER, GL_TEXTURE_BORDER_COLOR):
+// true on every desktop backend (core since GL 1.3, below this wrapper's 3.2
+// floor) and on any GLES backend that is 3.2+ or advertises
+// GL_EXT_texture_border_clamp/GL_OES_texture_border_clamp - false on a GLES
+// 3.0/3.1 backend with neither, which is a real device this wrapper may run
+// on. Both glTexParameter's own validation and the advertised extension
+// string go through this rather than assume the wrapper's guaranteed floor
+// covers it, the way every other name in kDesktopExtensions can.
+bool sfpewTextureBorderClampSupported();
+// Count of kDesktopExtensions (getter_version_strings.cpp): the desktop
+// extension names glGetString(GL_EXTENSIONS)/glGetStringi splice in ahead of
+// the backend's own set. glGetIntegerv's GL_NUM_EXTENSIONS case needs the
+// count without needing the names.
+extern const GLint kDesktopExtensionCount;
 
 GLuint sfpewLogicalTextureBinding(GLenum target);
+// Same question for a unit that need not be the currently active one (GL
+// 2.1's glActiveTexture is the only way an app can address any other unit,
+// so this is a cache-only lookup, never a live query - a unit this thread
+// has not seen bound is reported as texture 0, the spec default for a unit
+// nothing has ever bound).
+GLuint sfpewLogicalTextureBindingForUnit(GLenum unit, GLenum target);
 // Changes whenever the active texture unit or any texture binding does.
 uint64_t sfpewTextureStateGeneration();
 GLint sfpewLogicalProgram();
@@ -125,6 +145,12 @@ bool sfpewPackPboBound();
 void sfpewSetGenerateMipmap(GLenum target, GLuint texture, bool enable);
 void sfpewMaybeGenerateMipmap(GLenum target);
 void sfpewRememberTextureSize(GLuint texture, GLsizei width, GLsizei height);
+// Drops texture's cached size/level metadata (texture_image.cpp's
+// texture_metadata_cache_t). Called from glDeleteTextures (texture_binding.cpp).
+void sfpewForgetTextureMetadata(GLuint texture);
+// GL_ARB_depth_texture's GL_DEPTH_TEXTURE_MODE swizzle (texture_image.cpp); a
+// no-op unless `texture`'s current level-0 internalformat is a depth one.
+void sfpewApplyDepthTextureModeSwizzle(GLenum target, GLuint texture);
 SFPEW_APIENTRY void glGetTexImage(GLenum target, GLint level, GLenum format, GLenum type, GLvoid* pixels);
 SFPEW_APIENTRY void glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, GLvoid* pixels);
 
@@ -293,6 +319,12 @@ SFPEW_APIENTRY void glCompressedTexSubImage1D(GLenum target, GLint level, GLint 
                                              GLsizei width, GLenum format, GLsizei imageSize,
                                              const GLvoid* data);
 SFPEW_APIENTRY void glGetCompressedTexImage(GLenum target, GLint level, GLvoid* pixels);
+SFPEW_APIENTRY void glCompressedTexImage2D(GLenum target, GLint level, GLenum internalformat,
+                                          GLsizei width, GLsizei height, GLint border,
+                                          GLsizei imageSize, const GLvoid* data);
+SFPEW_APIENTRY void glCompressedTexSubImage2D(GLenum target, GLint level, GLint xoffset,
+                                             GLint yoffset, GLsizei width, GLsizei height,
+                                             GLenum format, GLsizei imageSize, const GLvoid* data);
 SFPEW_APIENTRY void glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width,
                                     GLsizei height, GLenum format, GLenum type, const GLvoid* pixels);
 SFPEW_APIENTRY const GLubyte* glGetString(GLenum name);

@@ -124,7 +124,7 @@ void SweepEveryStateVariable(const Queries& q) {
             ADD_FAILURE() << row.name << " answered nothing at all";
             continue;
         }
-        // The four forms are one value in four types. Colours and normals
+        // The four forms are one value in four types. Colors and normals
         // are the documented exception for the integer form, so compare the
         // ones that never rescale.
         for (int k = 0; k < row.count; ++k) {
@@ -165,7 +165,17 @@ TEST_F(Gl2StateTest, InitialValuesMatchTheManual) {
     EXPECT_EQ(q.Integer(0x807A), 4) << "GL_VERTEX_ARRAY_SIZE";
     EXPECT_EQ(q.Integer(0x807B), static_cast<GLint>(GL_FLOAT_)) << "GL_VERTEX_ARRAY_TYPE";
     EXPECT_EQ(q.Integer(0x84E1), static_cast<GLint>(GL_TEXTURE0_)) << "GL_CLIENT_ACTIVE_TEXTURE";
-    EXPECT_EQ(q.Integer(0x0B40), static_cast<GLint>(GL_FILL_)) << "GL_POLYGON_MODE";
+    // GL_POLYGON_MODE returns two values (front, back), not one - q.Integer()
+    // only ever gives glGetIntegerv a single GLint of storage, so routing
+    // this pname through it wrote past the end of that stack variable
+    // (an ASan stack-buffer-overflow in CI, since GL_POLYGON_MODE is
+    // genuinely two-valued in this wrapper's own fixedFunctionState() too,
+    // matching real GL: glGetIntegerv(GL_POLYGON_MODE, ...) has always been
+    // spec'd to write both faces' mode, not just one).
+    GLint polygon_mode[2] = {-12345, -12345};
+    q.get_integerv(0x0B40, polygon_mode);
+    EXPECT_EQ(polygon_mode[0], static_cast<GLint>(GL_FILL_)) << "GL_POLYGON_MODE front";
+    EXPECT_EQ(polygon_mode[1], static_cast<GLint>(GL_FILL_)) << "GL_POLYGON_MODE back";
     EXPECT_EQ(q.Integer(0x0BB0), 0) << "GL_ATTRIB_STACK_DEPTH";
     EXPECT_EQ(q.Integer(0x0DD1), 1) << "GL_MAP1_GRID_SEGMENTS";
     EXPECT_FLOAT_EQ(q.Float(0x0D16), 1.0f) << "GL_ZOOM_X";
@@ -173,10 +183,10 @@ TEST_F(Gl2StateTest, InitialValuesMatchTheManual) {
     EXPECT_FLOAT_EQ(q.Float(0x0D14), 1.0f) << "GL_RED_SCALE";
     EXPECT_FLOAT_EQ(q.Float(0x0D15), 0.0f) << "GL_RED_BIAS";
 
-    GLfloat colour[4] = {0, 0, 0, 0};
-    q.get_floatv(0x0B00, colour); // GL_CURRENT_COLOR
-    EXPECT_FLOAT_EQ(colour[0], 1.0f);
-    EXPECT_FLOAT_EQ(colour[3], 1.0f);
+    GLfloat color[4] = {0, 0, 0, 0};
+    q.get_floatv(0x0B00, color); // GL_CURRENT_COLOR
+    EXPECT_FLOAT_EQ(color[0], 1.0f);
+    EXPECT_FLOAT_EQ(color[3], 1.0f);
 
     GLfloat matrix[16] = {};
     q.get_floatv(0x0BA6, matrix); // GL_MODELVIEW_MATRIX

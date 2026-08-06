@@ -22,6 +22,19 @@ void flushPendingImmediateDraws();
 // wrapper's own bound (plans/12). One branch when nothing is held.
 void sfpewFlushDeferredDrawState();
 
+// What every glDrawArrays-shaped draw funnels through, whether from the
+// glDrawArrays entry point itself or a captured display-list command's
+// replay (fpe/list_capture.cpp). `arrayBufferOverride` >= 0 supplies the
+// attribute source buffer directly, skipping the synchronous binding query.
+void drawArraysNow(GLenum mode, GLint first, GLsizei count, bool forceFixedFunction,
+                   GLint arrayBufferOverride = -1);
+
+// Indexed counterpart of drawArraysNow (fpe/draw_now.cpp). External linkage
+// because multidraw.cpp's glMultiDrawElements falls back to it per sub-draw
+// when the backend has no native multi-draw or a sub-draw needs individual
+// fixed-function/user-program handling.
+void drawElementsNow(GLenum mode, GLsizei count, GLenum type, const GLvoid* indices);
+
 // What every exported entry point OUTSIDE the immediate-mode vertex family
 // calls first: drains the pending glyph batch and hands the app its draw state
 // back. Only glBegin/glEnd and the glVertex/glColor/glNormal/glTexCoord/
@@ -150,12 +163,12 @@ void mglTexCoord(std::array<Type, N> uv, GLint texid) {
     state.current_data.texcoord[texid] = mglDefaultedVec4<N>(uv);
 }
 
-// Colour material is a per-vertex side effect that mutates uniform material
+// Color material is a per-vertex side effect that mutates uniform material
 // state, so it has to stay ordered with the batch - but it is off for almost
 // every draw. Kept out of line so glColor4f can inline the part that always
 // runs: with the whole thing in one function the compiler declined to inline
 // it, and every immediate-mode vertex paid a call.
-void sfpewApplyColorMaterial(glstate_t& gs, const glm::vec4& colour);
+void sfpewApplyColorMaterial(glstate_t& gs, const glm::vec4& color);
 
 template <typename Type, GLint N>
 __attribute__((always_inline)) inline void mglColor(std::array<Type, N> color) {
