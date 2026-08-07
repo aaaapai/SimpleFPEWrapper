@@ -269,7 +269,7 @@ if(NOT ANDROID)
                 # Migrated suites. Each file is one area of behavior; the
                 # backend a case needs is chosen by its fixture. These need no
                 # driver at all - the wrapper's own bookkeeping.
-                foreach(suite load error display_list_cpu)
+                foreach(suite load error display_list_cpu ring_segment_sync)
                         sfpew_add_gtest(sfpew_${suite}_test SOURCES tests/gtest_${suite}.cc)
                 endforeach()
 
@@ -310,8 +310,11 @@ if(NOT ANDROID)
                                        secondary_color vertex_attrib_variants point_parameters
                                        texture_1d_copy drawpixels_formats copypixels_depth
                                        feedback_payloads selection_vbo pixel_maps
+                                       readpixels_formats
                                        imaging_color_table imaging_convolution
                                        imaging_histogram_minmax imaging_pipeline
+                                       imaging_base_format imaging_color_matrix
+                                       imaging_convolution_select
                                        pushattrib_depth_stencil_scissor getteximage_3d_cube
                                        color_sum logicop line_stipple texture_3d_cube
                                        read_buffer point_sprite texgen_cube
@@ -322,7 +325,21 @@ if(NOT ANDROID)
                                        texture_env_crossbar multitexture_unit_validation
                                        client_state_validation client_buffer_classification
                                        arrayelement_dlist drawelements_dlist
-                                       display_list_indexed_multidraw)
+                                       immediate_layout_epoch midprim_repack points_merge
+                                       vertexattrib_ordering
+                                       display_list_indexed_multidraw
+                                       map_buffer_barrier binding_query_barrier
+                                       pointer_validation interleaved_arrays
+                                       arrayelement_vbo arrayelement_bgra
+                                       delete_buffer_attrib_cache
+                                       user_program_upload_extent double_arrays
+                                       gather_stride_guard
+                                       bitmap_unpack pixel_private_upload
+                                       pixel_rect_rules
+                                       user_program_generic_arrays
+                                       texture_legacy_swizzle compressed_dlist_pbo
+                                       texture_scratch_context
+                                       pixel_dlist_record bitmap_dlist_advance)
                                 sfpew_add_gtest(sfpew_${suite}_test SOURCES tests/gtest_${suite}.cc
                                                 LIBRARIES ${SFPEW_TEST_EGL})
                         endforeach()

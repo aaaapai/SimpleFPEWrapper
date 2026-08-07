@@ -175,6 +175,85 @@ bool ensureDrawer(quad_drawer_t& d) {
     return d.vao != 0 && d.texture != 0;
 }
 
+// Every buffer these paths upload is one they built themselves: tightly
+// packed, in client memory. The caller's unpack layout describes THEIR image,
+// not this one - left in place it makes the driver stride past the end of a
+// private buffer, and a bound GL_PIXEL_UNPACK_BUFFER turns that buffer's
+// address into an offset into the buffer object, so the upload fails
+// outright. Neutralized for the length of the upload and restored on every
+// path out. GL_UNPACK_SWAP_BYTES/LSB_FIRST need no handling: glPixelStorei
+// keeps those two wrapper-side and never forwards them to the backend
+// (ordered_passthrough.cpp).
+struct private_unpack_guard_t {
+    GLint alignment = 4, row_length = 0, skip_rows = 0, skip_pixels = 0;
+    GLint image_height = 0, skip_images = 0, pbo = 0;
+    bool active = false;
+
+    private_unpack_guard_t() {
+        if (g_glFuncs.glGetIntegerv == nullptr || g_glFuncs.glPixelStorei == nullptr) return;
+        active = true;
+        g_glFuncs.glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
+        g_glFuncs.glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
+        g_glFuncs.glGetIntegerv(GL_UNPACK_SKIP_ROWS, &skip_rows);
+        g_glFuncs.glGetIntegerv(GL_UNPACK_SKIP_PIXELS, &skip_pixels);
+        g_glFuncs.glGetIntegerv(GL_UNPACK_IMAGE_HEIGHT, &image_height);
+        g_glFuncs.glGetIntegerv(GL_UNPACK_SKIP_IMAGES, &skip_images);
+        if (g_glFuncs.glBindBuffer != nullptr) {
+            g_glFuncs.glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &pbo);
+            if (pbo != 0) g_glFuncs.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        }
+        g_glFuncs.glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        g_glFuncs.glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+        g_glFuncs.glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+        g_glFuncs.glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+        g_glFuncs.glPixelStorei(GL_UNPACK_IMAGE_HEIGHT, 0);
+        g_glFuncs.glPixelStorei(GL_UNPACK_SKIP_IMAGES, 0);
+    }
+
+    ~private_unpack_guard_t() {
+        if (!active) return;
+        g_glFuncs.glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
+        g_glFuncs.glPixelStorei(GL_UNPACK_ROW_LENGTH, row_length);
+        g_glFuncs.glPixelStorei(GL_UNPACK_SKIP_ROWS, skip_rows);
+        g_glFuncs.glPixelStorei(GL_UNPACK_SKIP_PIXELS, skip_pixels);
+        g_glFuncs.glPixelStorei(GL_UNPACK_IMAGE_HEIGHT, image_height);
+        g_glFuncs.glPixelStorei(GL_UNPACK_SKIP_IMAGES, skip_images);
+        if (pbo != 0) g_glFuncs.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, static_cast<GLuint>(pbo));
+    }
+
+    private_unpack_guard_t(const private_unpack_guard_t&) = delete;
+    private_unpack_guard_t& operator=(const private_unpack_guard_t&) = delete;
+};
+
+// glDrawPixels/glCopyPixels produce fragments directly from the pixel
+// rectangle; culling applies to facets (glCullFace: "triangles,
+// quadrilaterals, polygons, and rectangles" - the primitives, not a pixel
+// rectangle), so it must have no say over whether one appears. The
+// screen-aligned quad standing in for it does have a winding - one that flips
+// with the sign of a glPixelZoom factor - so culling is turned off for the
+// draw instead of the winding being normalized by sign: normalizing only
+// answers glFrontFace, and would still leave the rectangle culled under
+// glCullFace(GL_FRONT_AND_BACK).
+struct no_cull_guard_t {
+    bool restore = false;
+
+    no_cull_guard_t() {
+        if (g_glFuncs.glIsEnabled == nullptr || g_glFuncs.glEnable == nullptr ||
+            g_glFuncs.glDisable == nullptr || g_glFuncs.glIsEnabled(GL_CULL_FACE) == GL_FALSE) {
+            return;
+        }
+        restore = true;
+        g_glFuncs.glDisable(GL_CULL_FACE);
+    }
+
+    ~no_cull_guard_t() {
+        if (restore) g_glFuncs.glEnable(GL_CULL_FACE);
+    }
+
+    no_cull_guard_t(const no_cull_guard_t&) = delete;
+    no_cull_guard_t& operator=(const no_cull_guard_t&) = delete;
+};
+
 // Draws `pixels` (tightly packed) as a screen-aligned quad anchored at
 // window coords (x0,y0) spanning (wpx,hpx) window pixels; bitmap mode
 // discards zero texels and paints with `color`.
@@ -197,40 +276,16 @@ void drawQuad(const void* pixels, GLsizei tex_w, GLsizei tex_h, GLenum tex_forma
     const GLuint unit_zero_binding = sfpewLogicalTextureBinding(GL_TEXTURE_2D);
     g_glFuncs.glBindTexture(GL_TEXTURE_2D, d.texture);
 
-    // Every pixel path hands this helper a tightly packed CPU buffer. Keep a
-    // caller's PBO and desktop unpack layout from reinterpreting that pointer.
-    GLint unpack_alignment = 4, unpack_row_length = 0, unpack_skip_rows = 0;
-    GLint unpack_skip_pixels = 0, unpack_image_height = 0, unpack_skip_images = 0;
-    GLint unpack_pbo = 0;
-    g_glFuncs.glGetIntegerv(GL_UNPACK_ALIGNMENT, &unpack_alignment);
-    g_glFuncs.glGetIntegerv(GL_UNPACK_ROW_LENGTH, &unpack_row_length);
-    g_glFuncs.glGetIntegerv(GL_UNPACK_SKIP_ROWS, &unpack_skip_rows);
-    g_glFuncs.glGetIntegerv(GL_UNPACK_SKIP_PIXELS, &unpack_skip_pixels);
-    g_glFuncs.glGetIntegerv(GL_UNPACK_IMAGE_HEIGHT, &unpack_image_height);
-    g_glFuncs.glGetIntegerv(GL_UNPACK_SKIP_IMAGES, &unpack_skip_images);
-    g_glFuncs.glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpack_pbo);
-    if (unpack_pbo != 0) g_glFuncs.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-    g_glFuncs.glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    g_glFuncs.glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-    g_glFuncs.glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
-    g_glFuncs.glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
-    g_glFuncs.glPixelStorei(GL_UNPACK_IMAGE_HEIGHT, 0);
-    g_glFuncs.glPixelStorei(GL_UNPACK_SKIP_IMAGES, 0);
-    const GLint internal_format = tex_format == GL_RED
-                                      ? (tex_type == GL_FLOAT ? GL_R32F : GL_R8)
-                                      : (tex_type == GL_FLOAT ? GL_RGBA32F : GL_RGBA8);
-    g_glFuncs.glTexImage2D(GL_TEXTURE_2D, 0, internal_format, tex_w, tex_h, 0, tex_format,
-                           tex_type, pixels);
-    g_glFuncs.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    g_glFuncs.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    g_glFuncs.glPixelStorei(GL_UNPACK_ALIGNMENT, unpack_alignment);
-    g_glFuncs.glPixelStorei(GL_UNPACK_ROW_LENGTH, unpack_row_length);
-    g_glFuncs.glPixelStorei(GL_UNPACK_SKIP_ROWS, unpack_skip_rows);
-    g_glFuncs.glPixelStorei(GL_UNPACK_SKIP_PIXELS, unpack_skip_pixels);
-    g_glFuncs.glPixelStorei(GL_UNPACK_IMAGE_HEIGHT, unpack_image_height);
-    g_glFuncs.glPixelStorei(GL_UNPACK_SKIP_IMAGES, unpack_skip_images);
-    if (unpack_pbo != 0)
-        g_glFuncs.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, static_cast<GLuint>(unpack_pbo));
+    {
+        private_unpack_guard_t unpack;
+        const GLint internal_format = tex_format == GL_RED
+                                          ? (tex_type == GL_FLOAT ? GL_R32F : GL_R8)
+                                          : (tex_type == GL_FLOAT ? GL_RGBA32F : GL_RGBA8);
+        g_glFuncs.glTexImage2D(GL_TEXTURE_2D, 0, internal_format, tex_w, tex_h, 0, tex_format,
+                               tex_type, pixels);
+        g_glFuncs.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        g_glFuncs.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    }
 
     const auto to_ndc_x = [&](GLfloat wx) { return (wx - viewport[0]) / viewport[2] * 2.0f - 1.0f; };
     const auto to_ndc_y = [&](GLfloat wy) { return (wy - viewport[1]) / viewport[3] * 2.0f - 1.0f; };
@@ -244,6 +299,7 @@ void drawQuad(const void* pixels, GLsizei tex_w, GLsizei tex_h, GLenum tex_forma
     g_glFuncs.glUniform1i(d.loc_mode, static_cast<GLint>(mode));
     g_glFuncs.glUniform1i(d.loc_tex, 0);
 
+    no_cull_guard_t no_cull;
     const auto& caller_mask = g_glstate_c.fpe_state.color_buffer.color_mask;
     // A fragment's gl_FragDepth write only reaches the depth buffer while
     // depth testing is enabled - with GL_DEPTH_TEST off (the GL default),
@@ -325,16 +381,15 @@ void drawStencilBitplanes(const GLubyte* stencil_bytes, GLsizei tex_w, GLsizei t
     g_glFuncs.glBindTexture(GL_TEXTURE_2D, d.texture);
 
     // stencil_bytes is this function's own tightly packed buffer (built by
-    // glDrawPixels below, not the caller's raw pointer), so only the
-    // alignment needs neutralizing - no row-length/PBO state to fight.
-    GLint unpack_alignment = 4;
-    g_glFuncs.glGetIntegerv(GL_UNPACK_ALIGNMENT, &unpack_alignment);
-    g_glFuncs.glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    g_glFuncs.glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, tex_w, tex_h, 0, GL_RED, GL_UNSIGNED_BYTE,
-                           stencil_bytes);
-    g_glFuncs.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    g_glFuncs.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    g_glFuncs.glPixelStorei(GL_UNPACK_ALIGNMENT, unpack_alignment);
+    // glDrawPixels below, not the caller's raw pointer), so the caller's whole
+    // unpack layout has to stand aside for it - see private_unpack_guard_t.
+    {
+        private_unpack_guard_t unpack;
+        g_glFuncs.glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, tex_w, tex_h, 0, GL_RED, GL_UNSIGNED_BYTE,
+                               stencil_bytes);
+        g_glFuncs.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        g_glFuncs.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    }
 
     const auto to_ndc_x = [&](GLfloat wx) { return (wx - viewport[0]) / viewport[2] * 2.0f - 1.0f; };
     const auto to_ndc_y = [&](GLfloat wy) { return (wy - viewport[1]) / viewport[3] * 2.0f - 1.0f; };
@@ -364,6 +419,7 @@ void drawStencilBitplanes(const GLubyte* stencil_bytes, GLsizei tex_w, GLsizei t
     if (g_glFuncs.glColorMask != nullptr)
         g_glFuncs.glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
 
+    no_cull_guard_t no_cull;
     for (int bit = 0; bit < 8; ++bit) {
         g_glFuncs.glUniform1i(d.loc_bit_index, bit);
         g_glFuncs.glStencilMask(static_cast<GLuint>(1 << bit));
@@ -404,6 +460,7 @@ void drawFullscreenTexture(GLuint texture, const glm::vec4& color) {
             g_glFuncs.glGenTextures(1, &white_tex);
             const GLubyte white[4] = {255, 255, 255, 255};
             g_glFuncs.glBindTexture(GL_TEXTURE_2D, white_tex);
+            private_unpack_guard_t unpack;
             g_glFuncs.glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE,
                                    white);
             g_glFuncs.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -428,7 +485,12 @@ void drawFullscreenTexture(GLuint texture, const glm::vec4& color) {
     g_glFuncs.glUniform4f(d.loc_color, color.r, color.g, color.b, color.a);
     g_glFuncs.glUniform1i(d.loc_mode, 0);
     g_glFuncs.glUniform1i(d.loc_tex, 0);
-    g_glFuncs.glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    {
+        // An accumulation-buffer operation is no more a facet than a pixel
+        // rectangle is; same reasoning as no_cull_guard_t's own comment.
+        no_cull_guard_t no_cull;
+        g_glFuncs.glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    }
 
     g_glFuncs.glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
     g_glFuncs.glActiveTexture((GLenum)prev_active);
@@ -479,10 +541,25 @@ bool ensureAccum(accum_state_t& a, GLsizei width, GLsizei height) {
     if (a.fbo != 0 && a.width == width && a.height == height) return true;
     if (a.fbo == 0) g_glFuncs.glGenFramebuffers(1, &a.fbo);
     if (a.texture == 0) g_glFuncs.glGenTextures(1, &a.texture);
-    if (a.scratch_tex == 0) g_glFuncs.glGenTextures(1, &a.scratch_tex);
+    if (a.scratch_tex == 0) {
+        g_glFuncs.glGenTextures(1, &a.scratch_tex);
+        // Sampled straight off its level 0, which glCopyTexImage2D respecifies
+        // per snapshot: at the default GL_NEAREST_MIPMAP_LINEAR min filter the
+        // texture is mipmap-incomplete, so every GL_ACCUM/GL_LOAD would read
+        // black instead of the framebuffer.
+        g_glFuncs.glBindTexture(GL_TEXTURE_2D, a.scratch_tex);
+        g_glFuncs.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        g_glFuncs.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    }
     g_glFuncs.glBindTexture(GL_TEXTURE_2D, a.texture);
-    g_glFuncs.glTexImage2D(GL_TEXTURE_2D, 0, 0x881A /* GL_RGBA16F */, width, height, 0, GL_RGBA,
-                           0x140B /* GL_HALF_FLOAT */, nullptr);
+    {
+        // Null data is an offset of zero into a bound unpack buffer, not "no
+        // data", so this allocation needs the caller's unpack state out of the
+        // way exactly as much as one carrying pixels does.
+        private_unpack_guard_t unpack;
+        g_glFuncs.glTexImage2D(GL_TEXTURE_2D, 0, 0x881A /* GL_RGBA16F */, width, height, 0, GL_RGBA,
+                               0x140B /* GL_HALF_FLOAT */, nullptr);
+    }
     g_glFuncs.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     g_glFuncs.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     g_glFuncs.glBindFramebuffer(0x8D40 /* GL_FRAMEBUFFER */, a.fbo);
@@ -528,6 +605,33 @@ void glClearAccum(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha) {
 namespace {
 
 void drainFailedMapError();
+
+// Where a bitmap's bits sit, per GL 2.1 3.6.4: rows are a*ceil(l/(8a)) bytes
+// apart - a = GL_UNPACK_ALIGNMENT (whose default is 4, so a tight ceil(w/8)
+// packing is the exception, not the rule) and l = GL_UNPACK_ROW_LENGTH or
+// width - and GL_UNPACK_SKIP_ROWS/SKIP_PIXELS select a sub-rectangle, the
+// latter counting BITS, so it need not land on a byte boundary.
+struct bitmap_unpack_layout_t {
+    size_t row_stride = 0;  // bytes between rows
+    size_t start = 0;       // bytes from the base of the image to row 0
+    size_t bit_offset = 0;  // bits into the first byte of every row
+    size_t extent = 0;      // bytes from the base of the image the whole rectangle spans
+};
+// Both defined further down, next to the pixel-unpack helpers they share.
+bool bitmapUnpackLayout(GLsizei width, GLsizei height, bitmap_unpack_layout_t* out);
+void drawBitmapRectangle(GLsizei width, GLsizei height, GLfloat xorig, GLfloat yorig,
+                         const GLubyte* bitmap, const bitmap_unpack_layout_t& layout);
+bool captureBitmapListPayload(GLsizei width, GLsizei height, const GLubyte* bitmap,
+                              std::vector<uint8_t>* out);
+
+// The compiled form of glBitmap: the payload is tight and MSB-first by then,
+// so nothing about the unpack state at glCallList may reach it - including a
+// bound unpack buffer, which would read the captured pointer as an offset.
+void replayBitmap(GLsizei width, GLsizei height, GLfloat xorig, GLfloat yorig, GLfloat xmove,
+                  GLfloat ymove, const GLubyte* bitmap) {
+    sfpew_list_unpack_replay_t unpack(false, false);
+    SELF_CALL(glBitmap, width, height, xorig, yorig, xmove, ymove, bitmap)
+}
 
 bool pixelMapIndex(GLenum map, size_t* index = nullptr) {
     if (map < GL_PIXEL_MAP_I_TO_I || map > GL_PIXEL_MAP_A_TO_A) return false;
@@ -797,9 +901,15 @@ void glAccum(GLenum op, GLfloat value) {
     if (viewport[2] <= 0 || viewport[3] <= 0) return;
 
     auto& a = accumState();
+    // Constructed before ensureAccum, not after: the lazy setup binds the
+    // accumulation framebuffer, and a guard that only starts saving afterwards
+    // records THAT as the caller's binding and restores it - so the first
+    // glAccum of a process leaves the app drawing into (and reading out of)
+    // the accumulation buffer, and its own GL_ACCUM/GL_LOAD snapshot copies
+    // from the RGBA16F accumulation storage instead of the caller's buffer.
+    accum_backend_guard_t backend;
     if (!ensureAccum(a, viewport[2], viewport[3])) return;
 
-    accum_backend_guard_t backend;
     const glm::vec4 scale(value, value, value, value);
 
     if (op == GL_ACCUM || op == GL_LOAD) {
@@ -839,29 +949,35 @@ void glBitmap(GLsizei width, GLsizei height, GLfloat xorig, GLfloat yorig, GLflo
         g_glstate.set_error(GL_INVALID_VALUE);
         return;
     }
+    // With a pixel unpack buffer bound `bitmap` is a byte offset into it
+    // (glBitmap's reference page), which makes offset 0 - a null pointer - a
+    // real bitmap to draw rather than "no bitmap".
+    const bool has_ink = width > 0 && height > 0 && (bitmap != nullptr || sfpewUnpackPboBound());
+
+    // plans/17 P13. GL 2.1 compiles every glBitmap, and the payload-free form
+    // is not a curiosity: glBitmap's own Notes give NULL-bitmap-with-xmove as
+    // the way to move the raster position outside the viewport, and
+    // glXUseXFont/wglUseFontBitmaps emit exactly that for a blank glyph. So
+    // this sits outside the drawing guard AND ahead of the raster-validity
+    // test - recording is not conditional on there being ink to draw, nor on
+    // a state the replay will evaluate for itself.
+    if (!disableRecording && DisplayListManager::shouldRecord()) {
+        std::vector<uint8_t> payload;
+        if (!has_ink || captureBitmapListPayload(width, height, bitmap, &payload)) {
+            displayListManager.record<replayBitmap>(
+                {{6, payload.size()}}, width, height, xorig, yorig, xmove, ymove,
+                payload.empty() ? nullptr : static_cast<const GLubyte*>(payload.data()));
+        }
+        if (DisplayListManager::shouldFinish()) return;
+    }
+
     if (!g_glstate.fpe_uniform.raster_position_valid) return;
     auto& raster = g_glstate.fpe_uniform.raster_position;
 
-    if (width > 0 && height > 0 && bitmap != nullptr && sfpewEnsureBackend() &&
-        g_glFuncs.glTexImage2D != nullptr) {
-        LIST_RECORD(glBitmap, {{6, (size_t)((width + 7) / 8) * (size_t)height}}, width, height, xorig,
-                    yorig, xmove, ymove, bitmap)
-        // Unpack: bitmap rows are ceil(w/8) bytes, MSB-first unless
-        // GL_UNPACK_LSB_FIRST; rows are not padded at alignment 1 (we
-        // conservatively assume the common tight case).
-        const bool lsb_first = g_glstate.pixel_store_unpack_lsb_first;
-        const size_t row_bytes = (size_t)((width + 7) / 8);
-        std::vector<uint8_t> texels((size_t)width * (size_t)height);
-        for (GLsizei yy = 0; yy < height; ++yy) {
-            for (GLsizei xx = 0; xx < width; ++xx) {
-                const GLubyte byte = bitmap[yy * row_bytes + xx / 8];
-                const int bit = lsb_first ? (xx % 8) : (7 - xx % 8);
-                texels[(size_t)yy * width + xx] = ((byte >> bit) & 1u) ? 0xFF : 0x00;
-            }
-        }
-        drawQuad(texels.data(), width, height, GL_RED, GL_UNSIGNED_BYTE, raster.x - xorig,
-                 raster.y - yorig, (GLfloat)width, (GLfloat)height, raster.z,
-                 quad_mode_t::bitmap, g_glstate.fpe_uniform.raster_color);
+    bitmap_unpack_layout_t layout;
+    if (has_ink && sfpewEnsureBackend() && g_glFuncs.glTexImage2D != nullptr &&
+        bitmapUnpackLayout(width, height, &layout)) {
+        drawBitmapRectangle(width, height, xorig, yorig, bitmap, layout);
     }
 
     // The raster position always advances, even for w/h 0 or null bitmaps.
@@ -1002,7 +1118,11 @@ bool describePixelType(GLenum format, const pixel_format_info_t& format_info, GL
     if (!packedPixelType(type, widths, &packed_components, pixel_bytes, &reversed)) return false;
     (void)widths;
     (void)reversed;
-    if ((packed_components == 3 && format != GL_RGB && format != GL_BGR) ||
+    // The three-field packings (_3_3_2/_2_3_3_REV/_5_6_5/_5_6_5_REV) are
+    // GL_RGB and nothing else - GL_BGR is not exempt, unlike the four-field
+    // packings, which do take GL_BGRA (GL 2.1 3.6.4, and glDrawPixels' own
+    // error list).
+    if ((packed_components == 3 && format != GL_RGB) ||
         (packed_components == 4 && format != GL_RGBA && format != GL_BGRA)) {
         g_glstate.set_error(GL_INVALID_OPERATION);
         return false;
@@ -1187,44 +1307,14 @@ void drainFailedMapError() {
     while (g_glFuncs.glGetError() != GL_NO_ERROR) {}
 }
 
-bool preparePixelUnpackView(GLsizei width, GLsizei height, size_t pixel_bytes,
-                            const GLvoid* pixels, pixel_unpack_view_t* out) {
-    if (g_glFuncs.glGetIntegerv == nullptr) return false;
-
-    GLint alignment = 4, row_length = 0, skip_rows = 0, skip_pixels = 0, pbo = 0;
-    g_glFuncs.glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
-    g_glFuncs.glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
-    g_glFuncs.glGetIntegerv(GL_UNPACK_SKIP_ROWS, &skip_rows);
-    g_glFuncs.glGetIntegerv(GL_UNPACK_SKIP_PIXELS, &skip_pixels);
+// Points `out->pixels` at the first byte of an unpack whose layout is already
+// resolved: client memory plus `start`, or - when a pixel unpack buffer is
+// bound, which makes `pixels` a byte offset into it - that buffer mapped for
+// reading. `needed` is the whole extent read, measured from that offset.
+bool mapPixelUnpackSource(const GLvoid* pixels, size_t start, size_t needed,
+                          pixel_unpack_view_t* out) {
+    GLint pbo = 0;
     g_glFuncs.glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &pbo);
-    if ((alignment != 1 && alignment != 2 && alignment != 4 && alignment != 8) ||
-        row_length < 0 || skip_rows < 0 || skip_pixels < 0) {
-        g_glstate.set_error(GL_INVALID_OPERATION);
-        return false;
-    }
-
-    const size_t row_pixels = row_length > 0 ? static_cast<size_t>(row_length)
-                                             : static_cast<size_t>(width);
-    size_t row_bytes = 0, padded_row_bytes = 0;
-    if (!checkedPixelMultiply(row_pixels, pixel_bytes, &row_bytes) ||
-        !checkedPixelAdd(row_bytes, static_cast<size_t>(alignment - 1), &padded_row_bytes)) {
-        g_glstate.set_error(GL_OUT_OF_MEMORY);
-        return false;
-    }
-    out->row_stride = padded_row_bytes & ~static_cast<size_t>(alignment - 1);
-
-    size_t start = 0, last_row = 0, final_row_bytes = 0, needed = 0;
-    if (!checkedPixelMultiply(static_cast<size_t>(skip_rows), out->row_stride, &start) ||
-        !checkedPixelMultiply(static_cast<size_t>(skip_pixels), pixel_bytes, &final_row_bytes) ||
-        !checkedPixelAdd(start, final_row_bytes, &start) ||
-        !checkedPixelMultiply(static_cast<size_t>(height - 1), out->row_stride, &last_row) ||
-        !checkedPixelMultiply(static_cast<size_t>(width), pixel_bytes, &final_row_bytes) ||
-        !checkedPixelAdd(start, last_row, &needed) ||
-        !checkedPixelAdd(needed, final_row_bytes, &needed)) {
-        g_glstate.set_error(GL_OUT_OF_MEMORY);
-        return false;
-    }
-
     if (pbo == 0) {
         if (pixels == nullptr) return false;
         out->pixels = static_cast<const uint8_t*>(pixels) + start;
@@ -1287,6 +1377,150 @@ bool preparePixelUnpackView(GLsizei width, GLsizei height, size_t pixel_bytes,
     }
     out->mapped_target = GL_COPY_WRITE_BUFFER;
     out->pixels = mapped + start;
+    return true;
+}
+
+bool bitmapUnpackLayout(GLsizei width, GLsizei height, bitmap_unpack_layout_t* out) {
+    if (g_glFuncs.glGetIntegerv == nullptr) return false;
+    GLint alignment = 4, row_length = 0, skip_rows = 0, skip_pixels = 0;
+    g_glFuncs.glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
+    g_glFuncs.glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
+    g_glFuncs.glGetIntegerv(GL_UNPACK_SKIP_ROWS, &skip_rows);
+    g_glFuncs.glGetIntegerv(GL_UNPACK_SKIP_PIXELS, &skip_pixels);
+    if ((alignment != 1 && alignment != 2 && alignment != 4 && alignment != 8) || row_length < 0 ||
+        skip_rows < 0 || skip_pixels < 0) {
+        g_glstate.set_error(GL_INVALID_OPERATION);
+        return false;
+    }
+
+    const size_t a = static_cast<size_t>(alignment);
+    const size_t row_pixels = row_length > 0 ? static_cast<size_t>(row_length)
+                                             : static_cast<size_t>(width);
+    size_t rows_of_a = 0, start = 0, last_row = 0, extent = 0;
+    if (!checkedPixelAdd(row_pixels, 8u * a - 1u, &rows_of_a)) {
+        g_glstate.set_error(GL_OUT_OF_MEMORY);
+        return false;
+    }
+    out->bit_offset = static_cast<size_t>(skip_pixels) % 8u;
+    if (!checkedPixelMultiply(a, rows_of_a / (8u * a), &out->row_stride) ||
+        !checkedPixelMultiply(static_cast<size_t>(skip_rows), out->row_stride, &start) ||
+        !checkedPixelAdd(start, static_cast<size_t>(skip_pixels) / 8u, &start) ||
+        !checkedPixelMultiply(static_cast<size_t>(height - 1), out->row_stride, &last_row) ||
+        !checkedPixelAdd(start, last_row, &extent) ||
+        !checkedPixelAdd(extent, (out->bit_offset + static_cast<size_t>(width) + 7u) / 8u,
+                         &extent)) {
+        g_glstate.set_error(GL_OUT_OF_MEMORY);
+        return false;
+    }
+    out->start = start;
+    out->extent = extent;
+    return true;
+}
+
+void drawBitmapRectangle(GLsizei width, GLsizei height, GLfloat xorig, GLfloat yorig,
+                         const GLubyte* bitmap, const bitmap_unpack_layout_t& layout) {
+    std::vector<uint8_t> texels;
+    try {
+        texels.resize(static_cast<size_t>(width) * static_cast<size_t>(height));
+    } catch (const std::bad_alloc&) {
+        g_glstate.set_error(GL_OUT_OF_MEMORY);
+        return;
+    }
+    {
+        pixel_unpack_view_t source;
+        if (!mapPixelUnpackSource(bitmap, layout.start, layout.extent, &source)) return;
+        // MSB-first within each byte unless GL_UNPACK_LSB_FIRST.
+        const bool lsb_first = g_glstate.pixel_store_unpack_lsb_first;
+        for (GLsizei row = 0; row < height; ++row) {
+            const uint8_t* line = source.pixels + static_cast<size_t>(row) * layout.row_stride;
+            for (GLsizei column = 0; column < width; ++column) {
+                const size_t bit_index = layout.bit_offset + static_cast<size_t>(column);
+                const uint8_t byte = line[bit_index / 8u];
+                const int bit = lsb_first ? static_cast<int>(bit_index % 8u)
+                                          : static_cast<int>(7u - bit_index % 8u);
+                texels[static_cast<size_t>(row) * static_cast<size_t>(width) +
+                       static_cast<size_t>(column)] = ((byte >> bit) & 1u) ? 0xFF : 0x00;
+            }
+        }
+    }
+
+    const auto& raster = g_glstate.fpe_uniform.raster_position;
+    // No glPixelZoom here: a bitmap's fragments are one per bit (GL 2.1 3.7).
+    drawQuad(texels.data(), width, height, GL_RED, GL_UNSIGNED_BYTE, raster.x - xorig,
+             raster.y - yorig, static_cast<GLfloat>(width), static_cast<GLfloat>(height), raster.z,
+             quad_mode_t::bitmap, g_glstate.fpe_uniform.raster_color);
+}
+
+bool preparePixelUnpackView(GLsizei width, GLsizei height, size_t pixel_bytes,
+                            const GLvoid* pixels, pixel_unpack_view_t* out) {
+    if (g_glFuncs.glGetIntegerv == nullptr) return false;
+
+    GLint alignment = 4, row_length = 0, skip_rows = 0, skip_pixels = 0;
+    g_glFuncs.glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
+    g_glFuncs.glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
+    g_glFuncs.glGetIntegerv(GL_UNPACK_SKIP_ROWS, &skip_rows);
+    g_glFuncs.glGetIntegerv(GL_UNPACK_SKIP_PIXELS, &skip_pixels);
+    if ((alignment != 1 && alignment != 2 && alignment != 4 && alignment != 8) ||
+        row_length < 0 || skip_rows < 0 || skip_pixels < 0) {
+        g_glstate.set_error(GL_INVALID_OPERATION);
+        return false;
+    }
+
+    const size_t row_pixels = row_length > 0 ? static_cast<size_t>(row_length)
+                                             : static_cast<size_t>(width);
+    size_t row_bytes = 0, padded_row_bytes = 0;
+    if (!checkedPixelMultiply(row_pixels, pixel_bytes, &row_bytes) ||
+        !checkedPixelAdd(row_bytes, static_cast<size_t>(alignment - 1), &padded_row_bytes)) {
+        g_glstate.set_error(GL_OUT_OF_MEMORY);
+        return false;
+    }
+    out->row_stride = padded_row_bytes & ~static_cast<size_t>(alignment - 1);
+
+    size_t start = 0, last_row = 0, final_row_bytes = 0, needed = 0;
+    if (!checkedPixelMultiply(static_cast<size_t>(skip_rows), out->row_stride, &start) ||
+        !checkedPixelMultiply(static_cast<size_t>(skip_pixels), pixel_bytes, &final_row_bytes) ||
+        !checkedPixelAdd(start, final_row_bytes, &start) ||
+        !checkedPixelMultiply(static_cast<size_t>(height - 1), out->row_stride, &last_row) ||
+        !checkedPixelMultiply(static_cast<size_t>(width), pixel_bytes, &final_row_bytes) ||
+        !checkedPixelAdd(start, last_row, &needed) ||
+        !checkedPixelAdd(needed, final_row_bytes, &needed)) {
+        g_glstate.set_error(GL_OUT_OF_MEMORY);
+        return false;
+    }
+    return mapPixelUnpackSource(pixels, start, needed, out);
+}
+
+// plans/17 P13: the compile-time bitmap, repacked into tight MSB-first rows
+// of ceil(width/8) bytes. GL_UNPACK_SKIP_PIXELS counts BITS, so its sub-byte
+// remainder has nowhere to live in a byte-granular tight copy and is shifted
+// out here; GL_UNPACK_LSB_FIRST goes with it, being the same loop.
+bool captureBitmapListPayload(GLsizei width, GLsizei height, const GLubyte* bitmap,
+                              std::vector<uint8_t>* out) {
+    bitmap_unpack_layout_t layout;
+    if (!bitmapUnpackLayout(width, height, &layout)) return false;
+    const size_t tight_stride = (static_cast<size_t>(width) + 7u) / 8u;
+    try {
+        out->assign(tight_stride * static_cast<size_t>(height), 0u);
+    } catch (const std::bad_alloc&) {
+        g_glstate.set_error(GL_OUT_OF_MEMORY);
+        return false;
+    }
+    pixel_unpack_view_t source;
+    if (!mapPixelUnpackSource(bitmap, layout.start, layout.extent, &source)) return false;
+    const bool lsb_first = g_glstate.pixel_store_unpack_lsb_first;
+    for (GLsizei row = 0; row < height; ++row) {
+        const uint8_t* line = source.pixels + static_cast<size_t>(row) * layout.row_stride;
+        uint8_t* destination = out->data() + static_cast<size_t>(row) * tight_stride;
+        for (GLsizei column = 0; column < width; ++column) {
+            const size_t bit_index = layout.bit_offset + static_cast<size_t>(column);
+            const int bit = lsb_first ? static_cast<int>(bit_index % 8u)
+                                      : static_cast<int>(7u - bit_index % 8u);
+            if (((line[bit_index / 8u] >> bit) & 1u) != 0u) {
+                destination[static_cast<size_t>(column) / 8u] |=
+                    static_cast<uint8_t>(0x80u >> (static_cast<size_t>(column) % 8u));
+            }
+        }
+    }
     return true;
 }
 
@@ -1364,6 +1598,190 @@ void drawStencilPixels(GLsizei width, GLsizei height, GLenum type, const GLvoid*
 
 } // namespace
 
+// --- Display-list capture of pixel rectangles (init.h documents the rule) --
+
+namespace {
+
+// Bytes one pixel of this format/type pair occupies in client memory. Wider
+// than describePixelFormat/describePixelType above, which answer for
+// glDrawPixels alone: a texture upload also takes GL_RG, the integer formats
+// and the combined depth/stencil types.
+bool pixelPayloadStride(GLenum format, GLenum type, size_t* bytes) {
+    // A packed type describes a whole pixel, so the format contributes
+    // nothing to its size; whether the two agree on the field count is each
+    // entry point's own validation.
+    switch (type) {
+    case GL_UNSIGNED_BYTE_3_3_2:
+    case GL_UNSIGNED_BYTE_2_3_3_REV:
+        *bytes = 1;
+        return true;
+    case GL_UNSIGNED_SHORT_5_6_5:
+    case GL_UNSIGNED_SHORT_5_6_5_REV:
+    case GL_UNSIGNED_SHORT_4_4_4_4:
+    case GL_UNSIGNED_SHORT_4_4_4_4_REV:
+    case GL_UNSIGNED_SHORT_5_5_5_1:
+    case GL_UNSIGNED_SHORT_1_5_5_5_REV:
+        *bytes = 2;
+        return true;
+    case GL_UNSIGNED_INT_8_8_8_8:
+    case GL_UNSIGNED_INT_8_8_8_8_REV:
+    case GL_UNSIGNED_INT_10_10_10_2:
+    case GL_UNSIGNED_INT_2_10_10_10_REV:
+    case GL_UNSIGNED_INT_24_8:
+    case GL_UNSIGNED_INT_10F_11F_11F_REV:
+    case GL_UNSIGNED_INT_5_9_9_9_REV:
+        *bytes = 4;
+        return true;
+    case GL_FLOAT_32_UNSIGNED_INT_24_8_REV:
+        *bytes = 8;
+        return true;
+    default:
+        break;
+    }
+    size_t scalar = 0;
+    switch (type) {
+    case GL_BYTE:
+    case GL_UNSIGNED_BYTE:
+        scalar = 1;
+        break;
+    case GL_SHORT:
+    case GL_UNSIGNED_SHORT:
+    case GL_HALF_FLOAT:
+        scalar = 2;
+        break;
+    case GL_INT:
+    case GL_UNSIGNED_INT:
+    case GL_FLOAT:
+        scalar = 4;
+        break;
+    default:
+        return false;
+    }
+    size_t components = 0;
+    switch (format) {
+    case GL_RED:
+    case GL_GREEN:
+    case GL_BLUE:
+    case GL_ALPHA:
+    case GL_LUMINANCE:
+    case GL_INTENSITY:
+    case GL_DEPTH_COMPONENT:
+    case GL_STENCIL_INDEX:
+    case GL_RED_INTEGER:
+    case GL_ALPHA_INTEGER:
+        components = 1;
+        break;
+    case GL_RG:
+    case GL_RG_INTEGER:
+    case GL_LUMINANCE_ALPHA:
+        components = 2;
+        break;
+    case GL_RGB:
+    case GL_BGR:
+    case GL_RGB_INTEGER:
+    case GL_BGR_INTEGER:
+        components = 3;
+        break;
+    case GL_RGBA:
+    case GL_BGRA:
+    case GL_RGBA_INTEGER:
+    case GL_BGRA_INTEGER:
+        components = 4;
+        break;
+    default:
+        return false;
+    }
+    *bytes = scalar * components;
+    return true;
+}
+
+} // namespace
+
+bool sfpewCaptureListPixelPayload(GLsizei width, GLsizei height, size_t pixel_bytes,
+                                  const GLvoid* pixels, std::vector<uint8_t>* out) {
+    out->clear();
+    if (width <= 0 || height <= 0 || pixel_bytes == 0) return true;
+    // A null pointer with no unpack buffer bound is an allocation with no
+    // image, not a rectangle that failed to read.
+    if (pixels == nullptr && !sfpewUnpackPboBound()) return true;
+    size_t row_bytes = 0, total = 0;
+    if (!checkedPixelMultiply(static_cast<size_t>(width), pixel_bytes, &row_bytes) ||
+        !checkedPixelMultiply(row_bytes, static_cast<size_t>(height), &total)) {
+        g_glstate.set_error(GL_OUT_OF_MEMORY);
+        return false;
+    }
+    pixel_unpack_view_t source;
+    if (!preparePixelUnpackView(width, height, pixel_bytes, pixels, &source)) return false;
+    try {
+        out->resize(total);
+    } catch (const std::bad_alloc&) {
+        g_glstate.set_error(GL_OUT_OF_MEMORY);
+        return false;
+    }
+    for (GLsizei row = 0; row < height; ++row) {
+        std::memcpy(out->data() + static_cast<size_t>(row) * row_bytes,
+                    source.pixels + static_cast<size_t>(row) * source.row_stride, row_bytes);
+    }
+    return true;
+}
+
+bool sfpewCaptureListPixelUpload(const char* entry, GLsizei width, GLsizei height, GLenum format,
+                                 GLenum type, const GLvoid* pixels, std::vector<uint8_t>* out) {
+    out->clear();
+    size_t pixel_bytes = 0;
+    if (!pixelPayloadStride(format, type, &pixel_bytes)) {
+        SFPEW_LOGW("%s: format 0x%x with type 0x%x has no known client-memory size; the call is "
+                   "not compiled into the display list", entry, format, type);
+        return false;
+    }
+    return sfpewCaptureListPixelPayload(width, height, pixel_bytes, pixels, out);
+}
+
+sfpew_list_unpack_replay_t::sfpew_list_unpack_replay_t(bool swap_bytes, bool lsb_first) {
+    if (!sfpewEnsureBackend() || g_glFuncs.glGetIntegerv == nullptr ||
+        g_glFuncs.glPixelStorei == nullptr || g_glFuncs.glBindBuffer == nullptr) {
+        return;
+    }
+    g_glFuncs.glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment_);
+    g_glFuncs.glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length_);
+    g_glFuncs.glGetIntegerv(GL_UNPACK_SKIP_ROWS, &skip_rows_);
+    g_glFuncs.glGetIntegerv(GL_UNPACK_SKIP_PIXELS, &skip_pixels_);
+    g_glFuncs.glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &pbo_);
+    swap_bytes_ = g_glstate.pixel_store_unpack_swap_bytes;
+    lsb_first_ = g_glstate.pixel_store_unpack_lsb_first;
+    if (pbo_ != 0) g_glFuncs.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    g_glFuncs.glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    g_glFuncs.glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    g_glFuncs.glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+    g_glFuncs.glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+    g_glstate.pixel_store_unpack_swap_bytes = swap_bytes;
+    g_glstate.pixel_store_unpack_lsb_first = lsb_first;
+    active_ = true;
+}
+
+sfpew_list_unpack_replay_t::~sfpew_list_unpack_replay_t() {
+    if (!active_) return;
+    g_glFuncs.glPixelStorei(GL_UNPACK_ALIGNMENT, alignment_);
+    g_glFuncs.glPixelStorei(GL_UNPACK_ROW_LENGTH, row_length_);
+    g_glFuncs.glPixelStorei(GL_UNPACK_SKIP_ROWS, skip_rows_);
+    g_glFuncs.glPixelStorei(GL_UNPACK_SKIP_PIXELS, skip_pixels_);
+    g_glstate.pixel_store_unpack_swap_bytes = swap_bytes_;
+    g_glstate.pixel_store_unpack_lsb_first = lsb_first_;
+    if (pbo_ != 0) g_glFuncs.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, static_cast<GLuint>(pbo_));
+}
+
+namespace {
+
+// The compiled form of glDrawPixels: its payload is already tight, so the
+// unpack state the app happens to have at glCallList must not reach it.
+void replayDrawPixels(GLsizei width, GLsizei height, GLenum format, GLenum type,
+                      GLboolean swap_bytes, const GLvoid* pixels) {
+    sfpew_list_unpack_replay_t unpack(swap_bytes != GL_FALSE, false);
+    SELF_CALL(glDrawPixels, width, height, format, type, pixels)
+}
+
+} // namespace
+
 void glDrawPixels(GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid* pixels) {
     sfpewEntryBarrier();
     if (width < 0 || height < 0) {
@@ -1380,6 +1798,20 @@ void glDrawPixels(GLsizei width, GLsizei height, GLenum format, GLenum type, con
         if (g_glstate.first_error == GL_NO_ERROR)
             g_glstate.set_error(GL_INVALID_ENUM);
         return;
+    }
+    // plans/17 P15. Ahead of the raster-position and zero-area tests below:
+    // both are execution-time conditions, and a rectangle whose raster
+    // position is invalid while the list compiles must still be compiled.
+    if (!disableRecording && DisplayListManager::shouldRecord()) {
+        std::vector<uint8_t> payload;
+        if (sfpewCaptureListPixelPayload(width, height, pixel_bytes, pixels, &payload)) {
+            displayListManager.record<replayDrawPixels>(
+                {{5, payload.size()}}, width, height, format, type,
+                static_cast<GLboolean>(g_glstate.pixel_store_unpack_swap_bytes ? GL_TRUE
+                                                                              : GL_FALSE),
+                payload.empty() ? nullptr : static_cast<const GLvoid*>(payload.data()));
+        }
+        if (DisplayListManager::shouldFinish()) return;
     }
     if (format_info.stencil) {
         // defects-plan-2.md 2.5: a 16-pass (2 per bit) bit-plane stencil
@@ -1710,6 +2142,11 @@ void glCopyPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum type) 
         g_glstate.set_error(GL_INVALID_ENUM);
         return;
     }
+    // plans/17 P15. No payload to snapshot - the source is the framebuffer as
+    // it stands at execution time - so this is a plain argument recording,
+    // taken before the execution-time conditions below the way its
+    // glCopyTexImage2D sibling is.
+    LIST_RECORD(glCopyPixels, {}, x, y, width, height, type)
     if (!g_glstate.fpe_uniform.raster_position_valid || width == 0 || height == 0 ||
         !sfpewEnsureBackend() || g_glFuncs.glBlitFramebuffer == nullptr) {
         return;
