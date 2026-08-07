@@ -639,6 +639,19 @@ void glLinkProgram(GLuint program) {
                 }
             }
         }
+        
+        {
+                std::lock_guard<std::mutex> lock(g_shader_mutex);
+                auto sit = shaderRecords().find(w.tus[i]);
+                if (sit != shaderRecords().end()) {
+                    sit->second.backend_uploaded_original = true;
+                    sit->second.backend_holds_native = true;
+                    sit->second.translated = false;
+                    sit->second.deferred = false;
+                    sit->second.uniform_inits.clear();
+                }
+        }
+
         g_glFuncs.glLinkProgram(program);
     } else if (tracked && !all_native && g_glFuncs.glShaderSource != nullptr &&
                g_glFuncs.glCompileShader != nullptr) {
