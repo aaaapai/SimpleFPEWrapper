@@ -631,12 +631,17 @@ void glLinkProgram(GLuint program) {
                 g_glFuncs.glCompileShader(w.tus[i]);
                 reportBackendCompileFailure(w.tus[i], stage, "native recompile (link)",
                                             w.sources[i]);
+
                 std::lock_guard<std::mutex> lock(g_shader_mutex);
                 auto sit = shaderRecords().find(w.tus[i]);
                 if (sit != shaderRecords().end()) {
                     sit->second.backend_uploaded_original = true;
                     sit->second.backend_holds_native = true;
+                    sit->second.translated = false;
+                    sit->second.deferred = false;
+                    sit->second.uniform_inits.clear();
                 }
+
             }
         }
         g_glFuncs.glLinkProgram(program);
