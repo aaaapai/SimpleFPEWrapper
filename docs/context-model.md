@@ -102,15 +102,18 @@ thread's shadows are thread-local.
    classifier, but it does not copy or merge CPU-side FPE state. Display-list
    definitions remain process-global. List *replay* always uses the current
    context's FPE state and GL objects, so rendering stays correct.
-3. **Resolver dispatch is per context.** A strict native Core request, or a
-   native Compatibility request the backend can create, receives backend
-   pointers for GL and non-intercepted EGL names from later `eglGetProcAddress`
-   calls while that context is current. The resolver itself and context
-   create/destroy remain SFPEW entry points so a caller can make a fresh lookup
-   after switching contexts. An unsupported Compatibility request is recreated
-   as Core and keeps SFPEW wrappers. A cached C function pointer cannot change
-   mode when the caller switches contexts; callers must resolve again after
-   switching to obtain the current context's native or wrapped pointer.
+3. **Resolver dispatch is per context.** A strict native Core request,
+   including an omitted profile mask for OpenGL 3.2 or later, or a native
+   Compatibility request the backend can create, receives backend pointers for
+   GL and non-intercepted EGL names from later `eglGetProcAddress` calls while
+   that context is current. An omitted profile mask below OpenGL 3.2 is a
+   legacy Compatibility request; if the backend cannot create it natively,
+   SFPEW recreates it as a Core 3.2 context and keeps its wrappers. The resolver
+   itself and context create/destroy remain SFPEW entry points so a caller can
+   make a fresh lookup after switching contexts. A cached C function pointer
+   cannot change mode when the caller switches contexts; callers must resolve
+   again after switching to obtain the current context's native or wrapped
+   pointer.
 4. **No-context calls are no-ops with throwaway state.** They cannot
    crash, but nothing done without a current context transfers into any
    real context later.

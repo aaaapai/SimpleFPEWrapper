@@ -22,13 +22,17 @@ capability signal: 417 pointers, each either usable or absent.
 ## Native-profile dispatch
 
 `eglCreateContext` resolved through SFPEW classifies every desktop context on
-its own. A strict Core-only request is passed through unchanged and subsequent
-lookups while it is current return the backend's exact `eglGetProcAddress`
-results. For an explicit Compatibility request SFPEW first probes, on a worker
-thread, whether the same backend/display/config can create that native profile:
-a successful probe leaves the application's request unchanged and dispatches
-natively; an unsuccessful probe rewrites only the backend request to Core and
-keeps the Compatibility-facing emulation layer enabled.
+its own. A strict Core-only request, including an omitted profile mask for
+OpenGL 3.2 or later, is passed through unchanged and subsequent lookups while
+it is current return the backend's exact `eglGetProcAddress` results. An
+omitted mask below OpenGL 3.2 is a legacy Compatibility request: OpenGL 1.x–3.1
+predates profile selection. For an explicit or legacy Compatibility request
+SFPEW first probes, on a worker thread, whether the same backend/display/config
+can create that native context. A successful probe leaves the application's
+request unchanged and dispatches natively; an unsuccessful probe rewrites only
+the backend request to Core and keeps the Compatibility-facing emulation layer
+enabled. Legacy fallback requests are raised to Core 3.2 because a Core profile
+mask is not valid for an older version.
 
 This choice belongs to an `EGLContext`, not the process. `eglGetProcAddress`
 itself, plus context create/destroy, remain SFPEW entry points so cached lookup

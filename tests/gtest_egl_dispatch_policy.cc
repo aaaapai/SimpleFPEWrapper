@@ -102,18 +102,93 @@ TEST(EglDispatchPolicy, ForwardCompatibleAndMixedProfilesStayWrapped) {
               Request::Wrapped);
 }
 
-TEST(EglDispatchPolicy, NonDesktopAndUnspecifiedRequestsStayWrapped) {
+TEST(EglDispatchPolicy, OmittedProfileFollowsEffectiveVersion) {
+    const EGLint version_32[] = {
+        EGL_CONTEXT_MAJOR_VERSION, 3,
+        EGL_CONTEXT_MINOR_VERSION, 2,
+        EGL_NONE,
+    };
+    const EGLint version_46[] = {
+        EGL_CONTEXT_MAJOR_VERSION, 4,
+        EGL_CONTEXT_MINOR_VERSION, 6,
+        EGL_NONE,
+    };
+    const EGLint version_21[] = {
+        EGL_CONTEXT_MAJOR_VERSION, 2,
+        EGL_CONTEXT_MINOR_VERSION, 1,
+        EGL_NONE,
+    };
+    const EGLint version_30[] = {
+        EGL_CONTEXT_MAJOR_VERSION, 3,
+        EGL_CONTEXT_MINOR_VERSION, 0,
+        EGL_NONE,
+    };
+    const EGLint version_31[] = {
+        EGL_CONTEXT_MAJOR_VERSION, 3,
+        EGL_CONTEXT_MINOR_VERSION, 1,
+        EGL_NONE,
+    };
+    const EGLint version_3[] = {EGL_CONTEXT_MAJOR_VERSION, 3, EGL_NONE};
+    const EGLint version_4[] = {EGL_CONTEXT_MAJOR_VERSION, 4, EGL_NONE};
+    const EGLint empty[] = {EGL_NONE};
+
+    EXPECT_EQ(sfpewClassifyEglContextAttributes(version_32, true).request,
+              Request::CoreOnly);
+    EXPECT_EQ(sfpewClassifyEglContextAttributes(version_46, true).request,
+              Request::CoreOnly);
+    EXPECT_EQ(sfpewClassifyEglContextAttributes(version_21, true).request,
+              Request::Compatibility);
+    EXPECT_EQ(sfpewClassifyEglContextAttributes(version_30, true).request,
+              Request::Compatibility);
+    EXPECT_EQ(sfpewClassifyEglContextAttributes(version_31, true).request,
+              Request::Compatibility);
+    EXPECT_EQ(sfpewClassifyEglContextAttributes(version_3, true).request,
+              Request::Compatibility);
+    EXPECT_EQ(sfpewClassifyEglContextAttributes(version_4, true).request,
+              Request::CoreOnly);
+    EXPECT_EQ(sfpewClassifyEglContextAttributes(empty, true).request,
+              Request::Compatibility);
+    EXPECT_EQ(sfpewClassifyEglContextAttributes(nullptr, true).request,
+              Request::Compatibility);
+}
+
+TEST(EglDispatchPolicy, LegacyOmittedProfileProducesCoreFallback) {
+    const EGLint version_21[] = {
+        EGL_CONTEXT_MAJOR_VERSION, 2,
+        EGL_CONTEXT_MINOR_VERSION, 1,
+        EGL_NONE,
+    };
+
+    const auto legacy = sfpewClassifyEglContextAttributes(version_21, true);
+    EXPECT_EQ(legacy.request, Request::Compatibility);
+    EXPECT_EQ(legacy.core_fallback,
+              (std::vector<EGLint>{
+                  EGL_CONTEXT_MAJOR_VERSION, 3,
+                  EGL_CONTEXT_MINOR_VERSION, 2,
+                  EGL_CONTEXT_OPENGL_PROFILE_MASK,
+                  EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
+                  EGL_NONE,
+              }));
+
+    const auto defaults = sfpewClassifyEglContextAttributes(nullptr, true);
+    EXPECT_EQ(defaults.request, Request::Compatibility);
+    EXPECT_EQ(defaults.core_fallback,
+              (std::vector<EGLint>{
+                  EGL_CONTEXT_MAJOR_VERSION, 3,
+                  EGL_CONTEXT_MINOR_VERSION, 2,
+                  EGL_CONTEXT_OPENGL_PROFILE_MASK,
+                  EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
+                  EGL_NONE,
+              }));
+}
+
+TEST(EglDispatchPolicy, NonDesktopRequestsStayWrapped) {
     const EGLint core[] = {
         EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
         EGL_NONE,
     };
-    const EGLint no_profile[] = {EGL_CONTEXT_MAJOR_VERSION, 3, EGL_NONE};
 
     EXPECT_EQ(sfpewClassifyEglContextAttributes(core, false).request,
-              Request::Wrapped);
-    EXPECT_EQ(sfpewClassifyEglContextAttributes(no_profile, true).request,
-              Request::Wrapped);
-    EXPECT_EQ(sfpewClassifyEglContextAttributes(nullptr, true).request,
               Request::Wrapped);
 }
 
@@ -130,11 +205,26 @@ TEST(EglDispatchPolicy, DuplicateAndUnterminatedRelevantListsStayWrapped) {
         EGL_CONTEXT_FLAGS_KHR, 0,
         EGL_NONE,
     };
+    const EGLint duplicate_major[] = {
+        EGL_CONTEXT_MAJOR_VERSION, 4,
+        EGL_CONTEXT_MAJOR_VERSION, 4,
+        EGL_NONE,
+    };
+    const EGLint duplicate_minor[] = {
+        EGL_CONTEXT_MAJOR_VERSION, 4,
+        EGL_CONTEXT_MINOR_VERSION, 6,
+        EGL_CONTEXT_MINOR_VERSION, 6,
+        EGL_NONE,
+    };
     std::vector<EGLint> unterminated(256, EGL_CONTEXT_MAJOR_VERSION);
 
     EXPECT_EQ(sfpewClassifyEglContextAttributes(duplicate_profile, true).request,
               Request::Wrapped);
     EXPECT_EQ(sfpewClassifyEglContextAttributes(duplicate_flags, true).request,
+              Request::Wrapped);
+    EXPECT_EQ(sfpewClassifyEglContextAttributes(duplicate_major, true).request,
+              Request::Wrapped);
+    EXPECT_EQ(sfpewClassifyEglContextAttributes(duplicate_minor, true).request,
               Request::Wrapped);
     EXPECT_EQ(sfpewClassifyEglContextAttributes(unterminated.data(), true).request,
               Request::Wrapped);

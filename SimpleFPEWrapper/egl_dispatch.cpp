@@ -19,6 +19,10 @@ constexpr size_t kMaxContextAttributes = 256;
 
 struct ParsedAttributes {
     bool valid = false;
+    bool has_major_version = false;
+    EGLint major_version = 1;
+    bool has_minor_version = false;
+    EGLint minor_version = 0;
     bool has_profile_mask = false;
     EGLint profile_mask = 0;
     bool has_forward_compatible = false;
@@ -48,6 +52,16 @@ ParsedAttributes parseAttributes(const EGLint* attribs) {
         parsed.values.push_back(key);
         parsed.values.push_back(value);
         switch (key) {
+        case EGL_CONTEXT_MAJOR_VERSION:
+            if (parsed.has_major_version) return parsed;
+            parsed.has_major_version = true;
+            parsed.major_version = value;
+            break;
+        case EGL_CONTEXT_MINOR_VERSION:
+            if (parsed.has_minor_version) return parsed;
+            parsed.has_minor_version = true;
+            parsed.minor_version = value;
+            break;
         case EGL_CONTEXT_OPENGL_PROFILE_MASK:
             if (parsed.has_profile_mask) return parsed;
             parsed.has_profile_mask = true;
@@ -76,14 +90,25 @@ bool isForwardCompatible(const ParsedAttributes& parsed) {
             (parsed.context_flags & EGL_CONTEXT_OPENGL_FORWARD_COMPATIBLE_BIT_KHR) != 0);
 }
 
+bool profileCapable(const ParsedAttributes& parsed) {
+    return parsed.major_version > 3 ||
+           (parsed.major_version == 3 && parsed.minor_version >= 2);
+}
+
 std::vector<EGLint> coreFallback(const ParsedAttributes& parsed) {
+    const bool needs_profile_mask = !parsed.has_profile_mask;
+    const bool needs_profile_version = !profileCapable(parsed);
     std::vector<EGLint> result;
-    result.reserve(parsed.values.size());
+    result.reserve(parsed.values.size() + 6);
     for (size_t i = 0; i + 1 < parsed.values.size(); i += 2) {
         const EGLint key = parsed.values[i];
         if (key == EGL_NONE) break;
         EGLint value = parsed.values[i + 1];
-        if (key == EGL_CONTEXT_OPENGL_PROFILE_MASK) {
+        if (key == EGL_CONTEXT_MAJOR_VERSION && needs_profile_version) {
+            value = 3;
+        } else if (key == EGL_CONTEXT_MINOR_VERSION && needs_profile_version) {
+            value = 2;
+        } else if (key == EGL_CONTEXT_OPENGL_PROFILE_MASK) {
             value = EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT;
         } else if (key == EGL_CONTEXT_OPENGL_FORWARD_COMPATIBLE) {
             value = EGL_FALSE;
@@ -92,6 +117,18 @@ std::vector<EGLint> coreFallback(const ParsedAttributes& parsed) {
         }
         result.push_back(key);
         result.push_back(value);
+    }
+    if (needs_profile_version && !parsed.has_major_version) {
+        result.push_back(EGL_CONTEXT_MAJOR_VERSION);
+        result.push_back(3);
+    }
+    if (needs_profile_version && !parsed.has_minor_version) {
+        result.push_back(EGL_CONTEXT_MINOR_VERSION);
+        result.push_back(2);
+    }
+    if (needs_profile_mask) {
+        result.push_back(EGL_CONTEXT_OPENGL_PROFILE_MASK);
+        result.push_back(EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT);
     }
     result.push_back(EGL_NONE);
     return result;
@@ -128,7 +165,17 @@ void noteCurrentContext(EGLContext context) {
 SfpewEglContextAttributes sfpewClassifyEglContextAttributes(const EGLint* attribs, bool desktop_api) {
     SfpewEglContextAttributes result;
     const ParsedAttributes parsed = parseAttributes(attribs);
-    if (!desktop_api || !parsed.valid || !parsed.has_profile_mask || isForwardCompatible(parsed)) return result;
+    if (!desktop_api || !parsed.valid || isForwardCompatible(parsed)) return result;
+
+    if (!parsed.has_profile_mask) {
+        if (profileCapable(parsed)) {
+            result.request = SfpewEglContextRequest::CoreOnly;
+        } else {
+            result.request = SfpewEglContextRequest::Compatibility;
+            result.core_fallback = coreFallback(parsed);
+        }
+        return result;
+    }
 
     if (parsed.profile_mask == EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT) {
         result.request = SfpewEglContextRequest::CoreOnly;
