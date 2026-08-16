@@ -89,22 +89,32 @@ thread's shadows are thread-local.
 
 ## Known limits (accepted, documented)
 
-1. **Context destruction is unobservable.** `eglDestroyContext` does not
-   pass through the wrapper, so the CPU-side `glstate_t` for a dead
-   context persists for the process lifetime. The GL objects it names die
-   with the context; the leak is bounded by the number of contexts a
-   process ever creates (1–2 for Minecraft-era launchers).
-2. **Share groups are invisible.** `eglCreateContext`'s share_context
-   argument never reaches us, so display-list definitions stay
-   process-global. This matches how launcher-era apps actually use shared
-   contexts (record on one thread, replay on the render thread) but means
-   two deliberately un-shared contexts would still see each other's list
-   IDs. List *replay* always uses the current context's FPE state and
-   GL objects, so rendering stays correct.
-3. **No-context calls are no-ops with throwaway state.** They cannot
+1. **Destroyed contexts remain observable until they are no longer current.**
+   `eglCreateContext` and `eglDestroyContext` resolved through SFPEW now record
+   a per-context dispatch policy. EGL can defer destruction while a context is
+   current, so a successful destroy marks its policy pending rather than
+   immediately discarding it; a subsequently reused handle replaces that
+   record on creation. The pre-existing CPU-side `glstate_t` remains process
+   lifetime state because its lifetime still cannot be safely synchronized to
+   every direct-EGL caller.
+2. **Share groups are visible to dispatch, not emulation state.**
+   `eglCreateContext`'s `share_context` argument now reaches the dispatch
+   classifier, but it does not copy or merge CPU-side FPE state. Display-list
+   definitions remain process-global. List *replay* always uses the current
+   context's FPE state and GL objects, so rendering stays correct.
+3. **Resolver dispatch is per context.** A strict native Core request, or a
+   native Compatibility request the backend can create, receives backend
+   pointers for GL and non-intercepted EGL names from later `eglGetProcAddress`
+   calls while that context is current. The resolver itself and context
+   create/destroy remain SFPEW entry points so a caller can make a fresh lookup
+   after switching contexts. An unsupported Compatibility request is recreated
+   as Core and keeps SFPEW wrappers. A cached C function pointer cannot change
+   mode when the caller switches contexts; callers must resolve again after
+   switching to obtain the current context's native or wrapped pointer.
+4. **No-context calls are no-ops with throwaway state.** They cannot
    crash, but nothing done without a current context transfers into any
    real context later.
-4. **Context switches are observed at entry granularity.** A context
+5. **Context switches are observed at entry granularity.** A context
    switch performed between two GL calls is observed by the next
    context-sensitive entry's strict resolve — never mid-call. Vertex-data
    calls inside a Begin/End batch deliberately do not observe switches at
@@ -117,7 +127,7 @@ thread's shadows are thread-local.
    evaluator entries (glMap*, glEvalCoord*, glEvalPoint*, glEvalMesh*)
    are pin-exempt: they anchor strictly at entry so the evaluator cache
    and the vertex sink always agree on one context.
-5. **`SFPEW_RELAXED_CONTEXT=1` (opt-in).** The app promises each thread
+6. **`SFPEW_RELAXED_CONTEXT=1` (opt-in).** The app promises each thread
    uses at most one EGL context for the process lifetime (true for
    Minecraft-era launchers). Strict resolves then trust the snapshot after
    a thread's first successful resolve and skip `eglGetCurrentContext()`
@@ -129,7 +139,7 @@ thread's shadows are thread-local.
    drop-on-switch check: in relaxed mode a batch collected before the
    thread released its context is still drawn against the frozen snapshot
    (calls without a current context are undefined; limit 3). Default: off.
-6. **Backend binding shadows assume wrapper-mediated binds.** The draw
+7. **Backend binding shadows assume wrapper-mediated binds.** The draw
    guard restores VAO/element bindings from shadows updated by wrapper
    code (`sfpewBackendBindVertexArray`/`ElementBuffer`) and self-heals
    with a real query every 256 draws. A VAO bound directly on the backend

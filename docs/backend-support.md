@@ -19,6 +19,24 @@ context is the backend.
 A missing entry point resolves to `nullptr`, which is the wrapper's single
 capability signal: 417 pointers, each either usable or absent.
 
+## Native-profile dispatch
+
+`eglCreateContext` resolved through SFPEW classifies every desktop context on
+its own. A strict Core-only request is passed through unchanged and subsequent
+lookups while it is current return the backend's exact `eglGetProcAddress`
+results. For an explicit Compatibility request SFPEW first probes, on a worker
+thread, whether the same backend/display/config can create that native profile:
+a successful probe leaves the application's request unchanged and dispatches
+natively; an unsuccessful probe rewrites only the backend request to Core and
+keeps the Compatibility-facing emulation layer enabled.
+
+This choice belongs to an `EGLContext`, not the process. `eglGetProcAddress`
+itself, plus context create/destroy, remain SFPEW entry points so cached lookup
+code can re-enter the per-context dispatcher for a later context. Function
+pointers for all other names are ordinary C pointers and cannot switch identity
+on `eglMakeCurrent`; code that mixes native and emulated contexts must resolve
+its GL functions again after binding the context it will use.
+
 ## Why the same calls work on both
 
 Of the 417 declared backend entry points, 390 are inside the
