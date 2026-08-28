@@ -7,6 +7,7 @@
 // End of Source File Header
 
 #include "EGL/egl.h"
+#include "egl_dispatch.h"
 #include "init.h"
 #include "log.h"
 #include <cstdio>
@@ -38,6 +39,27 @@
 
 SFPEW_APIENTRY __eglMustCastToProperFunctionPointerType eglGetProcAddress(const char* name) {
     if (!name) return nullptr;
+
+    // Keep the resolver itself stable so cached lookup code can re-enter this
+    // dispatch point after switching from a native to an emulated context.
+    if (std::strcmp("eglGetProcAddress", name) == 0)
+        return (__eglMustCastToProperFunctionPointerType)eglGetProcAddress;
+
+    // Context creation is always observed: a direct context may later create a
+    // compatibility context that requires the wrapper again.
+    if (std::strcmp("eglCreateContext", name) == 0)
+        return (__eglMustCastToProperFunctionPointerType)sfpewEglCreateContext;
+    if (std::strcmp("eglDestroyContext", name) == 0)
+        return (__eglMustCastToProperFunctionPointerType)sfpewEglDestroyContext;
+
+    // A pointer resolved while a native Core/Compatibility context is current
+    // must be the backend pointer itself, not a forwarding wrapper.
+    // Complete lazy initialization before the dispatch lookup reads the backend
+    // current-context hook or resolver table.
+    (void)sfpewEnsureBackend();
+    if (sfpewCurrentContextDispatch() == SfpewContextDispatchMode::BackendDirect) {
+        return g_eglFuncs.eglGetProcAddress != nullptr ? g_eglFuncs.eglGetProcAddress(name) : nullptr;
+    }
 
     // Routing eglMakeCurrent through the wrapper turns the current context
     // from something every state access has to ask libEGL about into a plain
@@ -1041,6 +1063,49 @@ SFPEW_APIENTRY void* glXGetProcAddressARB(const char* name) {
     return glXGetProcAddress(name);
 }
 
+// Context creation is where the wrapper decides whether this individual
+// context needs legacy emulation. The caller's list is never modified unless a
+// native Compatibility Profile probe proved unavailable.
+EGLContext sfpewEglCreateContext(EGLDisplay dpy, EGLConfig config, EGLContext share_context,
+                                 const EGLint* attrib_list) {
+    if (!sfpewEnsureBackend() || g_eglFuncs.eglCreateContext == nullptr) return EGL_NO_CONTEXT;
+
+    const bool desktop_api = g_eglFuncs.eglQueryAPI != nullptr &&
+                             g_eglFuncs.eglQueryAPI() == EGL_OPENGL_API;
+    const SfpewEglContextAttributes attributes =
+        sfpewClassifyEglContextAttributes(attrib_list, desktop_api);
+
+    if (attributes.request == SfpewEglContextRequest::CoreOnly) {
+        EGLContext context = g_eglFuncs.eglCreateContext(dpy, config, share_context, attrib_list);
+        if (context != EGL_NO_CONTEXT)
+            sfpewRegisterContextDispatch(context, SfpewContextDispatchMode::BackendDirect);
+        return context;
+    }
+
+    if (attributes.request == SfpewEglContextRequest::Compatibility) {
+        const bool native_compatibility = sfpewCanCreateNativeCompatibilityContext(dpy, config, attrib_list);
+        const EGLint* backend_attributes = native_compatibility ? attrib_list : attributes.core_fallback.data();
+        EGLContext context = g_eglFuncs.eglCreateContext(dpy, config, share_context, backend_attributes);
+        if (context != EGL_NO_CONTEXT) {
+            sfpewRegisterContextDispatch(context, native_compatibility
+                                                      ? SfpewContextDispatchMode::BackendDirect
+                                                      : SfpewContextDispatchMode::Wrapped);
+        }
+        return context;
+    }
+
+    EGLContext context = g_eglFuncs.eglCreateContext(dpy, config, share_context, attrib_list);
+    if (context != EGL_NO_CONTEXT) sfpewRegisterContextDispatch(context, SfpewContextDispatchMode::Wrapped);
+    return context;
+}
+
+EGLBoolean sfpewEglDestroyContext(EGLDisplay dpy, EGLContext ctx) {
+    if (!sfpewEnsureBackend() || g_eglFuncs.eglDestroyContext == nullptr) return EGL_FALSE;
+    const EGLBoolean ok = g_eglFuncs.eglDestroyContext(dpy, ctx);
+    if (ok == EGL_TRUE) sfpewForgetContextDispatch(ctx);
+    return ok;
+}
+
 // Wrapping eglMakeCurrent lets the wrapper know the current context exactly
 // instead of asking libEGL on every state access; see sfpewCurrentContext.
 // Same signature and return value as the backend's, so an app can use this
@@ -1055,7 +1120,10 @@ EGLBoolean sfpewEglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read,
     // geometry is then simply lost).
     sfpewEntryBarrier();
     const EGLBoolean ok = g_eglFuncs.eglMakeCurrent(dpy, draw, read, ctx);
-    if (ok == EGL_TRUE) sfpewNoteCurrentContext(ctx);
+    if (ok == EGL_TRUE) {
+        sfpewNoteCurrentContext(ctx);
+        sfpewNoteDispatchCurrentContext(ctx);
+    }
     return ok;
 }
 
@@ -1094,6 +1162,15 @@ EGLBoolean sfpewEglSwapBuffersWithDamageEXT(EGLDisplay dpy, EGLSurface surface, 
 }
 
 // Exported spellings for loaders that dlsym the wrapper for EGL.
+SFPEW_APIENTRY EGLContext eglCreateContext(EGLDisplay dpy, EGLConfig config, EGLContext share_context,
+                                          const EGLint* attrib_list) {
+    return sfpewEglCreateContext(dpy, config, share_context, attrib_list);
+}
+
+SFPEW_APIENTRY EGLBoolean eglDestroyContext(EGLDisplay dpy, EGLContext ctx) {
+    return sfpewEglDestroyContext(dpy, ctx);
+}
+
 SFPEW_APIENTRY EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read,
                                         EGLContext ctx) {
     return sfpewEglMakeCurrent(dpy, draw, read, ctx);

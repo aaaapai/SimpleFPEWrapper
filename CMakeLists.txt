@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.22.1)
 
 project("SimpleFPEWrapper")
 
+find_package(Threads REQUIRED)
+
 enable_language(CXX)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -85,6 +87,7 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         SimpleFPEWrapper/fbo.cpp
         SimpleFPEWrapper/texture_binding.cpp
         SimpleFPEWrapper/texture_image.cpp
+        SimpleFPEWrapper/egl_dispatch.cpp
         SimpleFPEWrapper/lookup.cpp
         SimpleFPEWrapper/ordered_passthrough.cpp
 
@@ -190,6 +193,7 @@ target_include_directories(${CMAKE_PROJECT_NAME} SYSTEM PRIVATE
         ${CMAKE_SOURCE_DIR}/3rdparty/SPIRV-Cross
 )
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE
+        Threads::Threads
         glslang glslang-default-resource-limits SPIRV spirv-cross-glsl spirv-cross-core)
 # GoogleTest, vendored like every other dependency; its install rules and
 # gmock are of no use here. The suites are the same source on either side:
@@ -222,7 +226,10 @@ function(sfpew_add_gtest name)
                 target_compile_definitions(${name} PRIVATE
                         WRAPPER_LIB_PATH="$<TARGET_FILE:${CMAKE_PROJECT_NAME}>")
         endif()
-        target_include_directories(${name} PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+        target_include_directories(${name} PRIVATE
+                ${CMAKE_SOURCE_DIR}/tests
+                ${CMAKE_SOURCE_DIR}
+                ${CMAKE_SOURCE_DIR}/include)
         target_link_libraries(${name} PRIVATE GTest::gtest_main dl ${ARG_LIBRARIES})
         add_dependencies(${name} ${CMAKE_PROJECT_NAME})
         # Discovery runs the binary, which a cross build cannot do.
@@ -272,6 +279,9 @@ if(NOT ANDROID)
                 foreach(suite load error display_list_cpu ring_segment_sync)
                         sfpew_add_gtest(sfpew_${suite}_test SOURCES tests/gtest_${suite}.cc)
                 endforeach()
+                sfpew_add_gtest(sfpew_egl_dispatch_policy_test
+                                SOURCES tests/gtest_egl_dispatch_policy.cc
+                                        SimpleFPEWrapper/egl_dispatch.cpp)
 
 
                 # tools/glbench: standalone CPU-overhead benchmark for ANY
@@ -338,7 +348,7 @@ if(NOT ANDROID)
                                        pixel_rect_rules
                                        user_program_generic_arrays
                                        texture_legacy_swizzle compressed_dlist_pbo
-                                       texture_scratch_context
+                                       texture_scratch_context egl_direct_dispatch
                                        pixel_dlist_record bitmap_dlist_advance)
                                 sfpew_add_gtest(sfpew_${suite}_test SOURCES tests/gtest_${suite}.cc
                                                 LIBRARIES ${SFPEW_TEST_EGL})
