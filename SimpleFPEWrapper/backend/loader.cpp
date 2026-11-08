@@ -7,6 +7,8 @@
 // End of Source File Header
 
 #include "loader.h"
+#include "../perf_backend.h"
+#include "../log.h"
 #include <dlfcn.h>
 #include <cstring>
 #include <vector>
@@ -42,16 +44,55 @@ namespace SFPEW::Utils::BackendLoader {
 #endif
     }
 
+#if !defined(__WIN32) && !defined(_WIN32) && !defined(__APPLE__)
+    // The backend's own resolver, and the library it lives in.
+    static External::EGL::eglGetProcAddress_PTR g_backendResolver = nullptr;
+    static void* g_backendLib = nullptr;
+
+    // Whether a pointer lands inside this library's image.
+    static bool IsOwnDefinition(const void* pointer) {
+        static const void* const ownBase = [] {
+            Dl_info self{};
+            return dladdr(reinterpret_cast<void*>(&IsOwnDefinition), &self) != 0 ? self.dli_fbase : nullptr;
+        }();
+        Dl_info info{};
+        return pointer != nullptr && ownBase != nullptr && dladdr(pointer, &info) != 0 && info.dli_fbase == ownBase;
+    }
+
+    // The backend's eglGetProcAddress, minus the answers that point back
+    // here. A backend that resolves GL names with dlsym(RTLD_DEFAULT) - as
+    // a desktop-GL layer can - finds this library's exports first whenever
+    // the wrapper was loaded globally, which is how launchers load it; the
+    // wrapper then "forwards" each call to itself, and a tail call such as
+    // glGetError's spins forever. The backend library's own scope has the
+    // definition meant.
+    static __eglMustCastToProperFunctionPointerType BackendProcAddress(const char* name) {
+        auto pointer = g_backendResolver(name);
+        if (!IsOwnDefinition(reinterpret_cast<void*>(pointer))) return pointer;
+        pointer = reinterpret_cast<__eglMustCastToProperFunctionPointerType>(ProcAddress(g_backendLib, name));
+        return IsOwnDefinition(reinterpret_cast<void*>(pointer)) ? nullptr : pointer;
+    }
+#endif
+
     bool AcquireBackendGLFunctions(External::BackendGLFunctionsTable& funcs,
                                    External::EGL::eglGetProcAddress_PTR procAddress) {
         if (!procAddress) {
             return false;
         }
 
+#if SFPEW_PERF_COUNTERS
+// Every resolved entry point goes through a counting thunk (perf_backend.h).
+#define INIT_BACKENDGL_FUNC(name)                                                                                      \
+    do {                                                                                                               \
+        funcs.name = sfpewPerfWrapBackend<__COUNTER__>((External::BackendGL::name##_PTR)procAddress(#name), #name, \
+                                                       &funcs.name);                                       \
+    } while (0);
+#else
 #define INIT_BACKENDGL_FUNC(name)                                                                                      \
     do {                                                                                                               \
         funcs.name = (External::BackendGL::name##_PTR)procAddress(#name);                                              \
     } while (0);
+#endif
 
         {
             INIT_BACKENDGL_FUNC(glActiveTexture)
@@ -433,22 +474,37 @@ namespace SFPEW::Utils::BackendLoader {
             INIT_BACKENDGL_FUNC(glMultiDrawElementsIndirectEXT)
             INIT_BACKENDGL_FUNC(glMultiDrawElementsBaseVertexEXT)
         }
+#if SFPEW_PERF_COUNTERS
+        sfpewPerfHookBackend(funcs);
+#endif
         return true;
     }
 
     bool AcquireEGLFunctions(External::EGLFunctionsTable& funcs, std::string customLibPath) {
-        std::vector<std::string> EGLLibNames = {"libEGL.so"};
-        if (!customLibPath.empty()) {
-            EGLLibNames.insert(EGLLibNames.begin(), customLibPath);
-        }
+        // Exactly the library asked for: falling back to the system libEGL when
+        // a configured backend fails to load would run a different backend
+        // than the one chosen, with nothing to say so.
+        const std::vector<std::string> EGLLibNames = {customLibPath.empty() ? std::string("libEGL.so") : customLibPath};
         void* eglLib = OpenLib(EGLLibNames);
         if (!eglLib) {
+            // The loader's reason - a missing dependency, an ABI mismatch -
+            // is what someone choosing a backend needs to see.
+            const char* reason = dlerror();
+            SFPEW_LOGE("cannot load backend '%s': %s", customLibPath.c_str(), reason != nullptr ? reason : "not found");
             return false;
         }
+#if SFPEW_PERF_COUNTERS
+#define INIT_EGL_FUNC(name)                                                                                            \
+    do {                                                                                                               \
+        funcs.name = sfpewPerfWrapBackend<__COUNTER__>((External::EGL::name##_PTR)ProcAddress(eglLib, #name), #name, \
+                                                       &funcs.name);                                       \
+    } while (0);
+#else
 #define INIT_EGL_FUNC(name)                                                                                            \
     do {                                                                                                               \
         funcs.name = (External::EGL::name##_PTR)ProcAddress(eglLib, #name);                                            \
     } while (0);
+#endif
 
         {
             INIT_EGL_FUNC(eglBindAPI)
@@ -499,6 +555,13 @@ namespace SFPEW::Utils::BackendLoader {
             INIT_EGL_FUNC(eglGetPlatformDisplay)
             INIT_EGL_FUNC(eglWaitSync)
         }
+#if !defined(__WIN32) && !defined(_WIN32) && !defined(__APPLE__)
+        if (funcs.eglGetProcAddress != nullptr) {
+            g_backendResolver = funcs.eglGetProcAddress;
+            g_backendLib = eglLib;
+            funcs.eglGetProcAddress = BackendProcAddress;
+        }
+#endif
         return true;
     }
 

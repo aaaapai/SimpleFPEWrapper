@@ -13,6 +13,8 @@
 #include <cstdio>
 #include "fpe/transformation.h"
 #include "fpe/drawing1x.h" // sfpewEntryBarrier: the swap must drain the pending batch
+#include "perf_counters.h"
+#include "perf_backend.h"
 
 #define GETPROC(name, var)                                                                                             \
     if (std::strcmp(#name, var) == 0) {                                                                                \
@@ -32,6 +34,19 @@
 // GETPROC_BACKEND_ALIAS, which hands out the backend's own pointer: for a
 // wrapped entry that would bypass the wrapper entirely, and legacy frontends
 // (LWJGL2) ask for the ARB spellings by preference.
+// A wrapper entry point for a command not every backend has, handed out only
+// where the backend resolves it too (under the given spelling), so a GLES
+// backend still reports the desktop-only ones as absent.
+#define GETPROC_IF_BACKEND(spelling, wrapped)                                                                          \
+    if (std::strcmp(#spelling, name) == 0) {                                                                           \
+        if (!sfpewEnsureBackend() || g_eglFuncs.eglGetProcAddress == nullptr ||                                         \
+            g_eglFuncs.eglGetProcAddress(#spelling) == nullptr)                                                        \
+            return nullptr;                                                                                            \
+        return (__eglMustCastToProperFunctionPointerType)wrapped;                                                      \
+    }
+#define GETPROC_CURRENT_ATTRIB(NAME, PARAMS, ARGS) GETPROC_IF_BACKEND(NAME, NAME)
+#define GETPROC_CURRENT_ATTRIB_EXT(NAME, PARAMS, ARGS) GETPROC_IF_BACKEND(NAME, NAME) GETPROC_IF_BACKEND(NAME##EXT, NAME)
+
 #define GETPROC_WRAPPER_ALIAS(alias, wrapped)                                                                          \
     if (std::strcmp(#alias, name) == 0) {                                                                              \
         return (__eglMustCastToProperFunctionPointerType)wrapped;                                                      \
@@ -53,12 +68,17 @@ SFPEW_APIENTRY __eglMustCastToProperFunctionPointerType eglGetProcAddress(const 
         return (__eglMustCastToProperFunctionPointerType)sfpewEglDestroyContext;
 
     // A pointer resolved while a native Core/Compatibility context is current
-    // must be the backend pointer itself, not a forwarding wrapper.
-    // Complete lazy initialization before the dispatch lookup reads the backend
-    // current-context hook or resolver table.
-    (void)sfpewEnsureBackend();
-    if (sfpewCurrentContextDispatch() == SfpewContextDispatchMode::BackendDirect) {
-        return g_eglFuncs.eglGetProcAddress != nullptr ? g_eglFuncs.eglGetProcAddress(name) : nullptr;
+    // must be the backend pointer itself, not a forwarding wrapper. Such a
+    // context exists only once sfpewEglCreateContext - which starts the
+    // backend - registered one; until then resolving a wrapper symbol must
+    // not start the backend (and load libEGL) just to find that out. After
+    // it, complete lazy initialization before the dispatch lookup reads the
+    // backend current-context hook or resolver table.
+    if (sfpewAnyBackendDirectContext()) {
+        (void)sfpewEnsureBackend();
+        if (sfpewCurrentContextDispatch() == SfpewContextDispatchMode::BackendDirect) {
+            return g_eglFuncs.eglGetProcAddress != nullptr ? g_eglFuncs.eglGetProcAddress(name) : nullptr;
+        }
     }
 
     // Routing eglMakeCurrent through the wrapper turns the current context
@@ -401,6 +421,8 @@ SFPEW_APIENTRY __eglMustCastToProperFunctionPointerType eglGetProcAddress(const 
     GETPROC(glTexParameterfv, name)
     GETPROC(glTexParameteri, name)
     GETPROC(glTexParameteriv, name)
+    GETPROC(glTexParameterIiv, name)
+    GETPROC(glTexParameterIuiv, name)
     GETPROC(glGetTexParameterfv, name)
     GETPROC(glGetTexParameteriv, name)
     GETPROC(glAreTexturesResident, name)
@@ -424,6 +446,8 @@ SFPEW_APIENTRY __eglMustCastToProperFunctionPointerType eglGetProcAddress(const 
     GETPROC(glGetBufferParameteriv, name)
     GETPROC(glVertexAttribPointer, name)
     GETPROC(glVertexAttribIPointer, name)
+    SFPEW_CURRENT_ATTRIB_SETTERS_EXT(GETPROC_CURRENT_ATTRIB_EXT)
+    SFPEW_CURRENT_ATTRIB_SETTERS(GETPROC_CURRENT_ATTRIB)
     GETPROC(glEnableVertexAttribArray, name)
     GETPROC(glDisableVertexAttribArray, name)
     if (std::strcmp("glBindBufferARB", name) == 0) {
@@ -1048,6 +1072,12 @@ SFPEW_APIENTRY __eglMustCastToProperFunctionPointerType eglGetProcAddress(const 
     if (!sfpewEnsureBackend() || g_eglFuncs.eglGetProcAddress == nullptr) {
         return nullptr;
     }
+#if SFPEW_PERF_COUNTERS
+    // The counted table entry, so the application's own driver calls are
+    // measured like the wrapper's (perf_backend.h).
+    if (void* counted = sfpewPerfBackendEntry(name))
+        return (__eglMustCastToProperFunctionPointerType)counted;
+#endif
     __eglMustCastToProperFunctionPointerType ptr = g_eglFuncs.eglGetProcAddress(name);
     if (!ptr) {
         SFPEW_LOGW("eglGetProcAddress: backend also failed to find '%s'", name);
@@ -1145,7 +1175,10 @@ EGLBoolean sfpewEglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     if (!sfpewEnsureBackend() || g_eglFuncs.eglSwapBuffers == nullptr) return EGL_FALSE;
     sfpewEntryBarrier();
     sfpewListLogFrame();
-    return g_eglFuncs.eglSwapBuffers(dpy, surface);
+    SFPEW_PERF_FRAME(true);
+    const EGLBoolean swapped = g_eglFuncs.eglSwapBuffers(dpy, surface);
+    sfpewNoteGpuIdle();
+    return swapped;
 }
 
 EGLBoolean sfpewEglSwapBuffersWithDamageEXT(EGLDisplay dpy, EGLSurface surface, EGLint* rects,
@@ -1153,8 +1186,13 @@ EGLBoolean sfpewEglSwapBuffersWithDamageEXT(EGLDisplay dpy, EGLSurface surface, 
     if (!sfpewEnsureBackend()) return EGL_FALSE;
     sfpewEntryBarrier();
     sfpewListLogFrame();
-    if (g_eglFuncs.eglSwapBuffersWithDamageEXT != nullptr)
-        return g_eglFuncs.eglSwapBuffersWithDamageEXT(dpy, surface, rects, n_rects);
+    SFPEW_PERF_FRAME(true);
+    if (g_eglFuncs.eglSwapBuffersWithDamageEXT != nullptr) {
+        const EGLBoolean swapped =
+            g_eglFuncs.eglSwapBuffersWithDamageEXT(dpy, surface, rects, n_rects);
+        sfpewNoteGpuIdle();
+        return swapped;
+    }
     // The damage rectangles are only a hint; a plain swap is a conforming
     // fallback and keeps the flush above from being the reason a frame is lost.
     if (g_eglFuncs.eglSwapBuffers != nullptr) return g_eglFuncs.eglSwapBuffers(dpy, surface);

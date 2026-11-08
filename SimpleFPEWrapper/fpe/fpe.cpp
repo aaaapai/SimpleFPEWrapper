@@ -8,6 +8,9 @@
 
 #include "fpe.hpp"
 #include "drawing1x.h"
+#include "../perf_counters.h"
+#include "../egl_dispatch.h"
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <glm/gtc/type_ptr.hpp>
@@ -29,12 +32,12 @@
 // Externally visible so the resolve's fast path can be inlined into every
 // exported entry point (see sfpewResolveState in types.h): the call to
 // get_instance was measured at 48% of a glGet, and every entry pays it.
-thread_local SFPEW_TLS_HOT void* g_authoritative_context = nullptr;
-thread_local SFPEW_TLS_HOT bool g_authoritative_context_known = false;
-thread_local SFPEW_TLS_HOT unsigned g_context_reconcile_counter = 0;
+SFPEW_TLS_HOT void* g_authoritative_context = nullptr;
+SFPEW_TLS_HOT bool g_authoritative_context_known = false;
+SFPEW_TLS_HOT unsigned g_context_reconcile_counter = 0;
 // Starts tight so a bypassing app is caught early, then backs off.
-thread_local SFPEW_TLS_HOT unsigned g_context_reconcile_interval = 64u;
-thread_local SFPEW_TLS_HOT unsigned g_resolve_budget = 0u;
+SFPEW_TLS_HOT unsigned g_context_reconcile_interval = 64u;
+SFPEW_TLS_HOT unsigned g_resolve_budget = 0u;
 bool g_sfpew_relaxed_context = [] {
     const char* value = getenv("SFPEW_RELAXED_CONTEXT");
     return value != nullptr && value[0] != '\0' && value[0] != '0';
@@ -62,6 +65,7 @@ void* sfpewReconcileContext() {
     g_context_reconcile_counter = 0;
     if (g_eglFuncs.eglGetCurrentContext == nullptr)
         return g_authoritative_context_known ? g_authoritative_context : nullptr;
+    SFPEW_PERF_COUNT(context_egl_query);
     void* const context = g_eglFuncs.eglGetCurrentContext();
     if (g_authoritative_context_known && context == g_authoritative_context) {
         // Confirmed again: trust it for longer. The cap keeps the bound well
@@ -83,8 +87,8 @@ EGLContext sfpewCurrentContext() { return sfpewCurrentContextInline(); }
 // get_instance() / current() / current_vertex_data() / cached_context(), and
 // by the inlined resolver in types.h. Declared there; see the note on the
 // initial-exec model beside those declarations.
-thread_local SFPEW_TLS_HOT void* tls_snapshot_context = (void*)(intptr_t)-1;
-thread_local SFPEW_TLS_HOT glstate_t* tls_snapshot_state = nullptr;
+SFPEW_TLS_HOT void* tls_snapshot_context = (void*)(intptr_t)-1;
+SFPEW_TLS_HOT glstate_t* tls_snapshot_state = nullptr;
 namespace {
 
 // SFPEW_RELAXED_CONTEXT=1: the app promises each thread uses at most one
@@ -94,6 +98,13 @@ namespace {
 // on glvnd desktops (getpid fork check + dispatch mutex). Default: off,
 // full lazy reconciliation per docs/context-model.md.
 } // namespace
+
+// Contexts the wrapper has made a glstate for (sfpewTexturesMayBeShared).
+std::atomic<unsigned> g_context_state_count{0};
+
+bool sfpewTexturesMayBeShared() {
+    return g_context_state_count.load(std::memory_order_relaxed) > 1 || sfpewAnyBackendDirectContext();
+}
 
 glstate_t& glstate_t::get_instance() {
     // Per-EGL-context FPE state (plans/07). The current context is resolved
@@ -113,6 +124,7 @@ glstate_t& glstate_t::get_instance() {
     static std::mutex instances_mutex;
     static glstate_t no_context_state; // keeps backend-less calls crash-free
 
+    SFPEW_PERF_COUNT(context_strict_resolve);
     // Refilling the budget is what lets the inlined fast path be a single
     // decrement; every return below therefore sets it.
     if (g_sfpew_relaxed_context && tls_snapshot_state != nullptr &&
@@ -135,6 +147,7 @@ glstate_t& glstate_t::get_instance() {
         return *tls_snapshot_state;
     }
 
+    SFPEW_PERF_COUNT(context_switch);
     // The thread switched contexts. If the outgoing snapshot still holds an
     // open Begin/End batch, that batch was abandoned mid-collection: clear it
     // here so the vertex-data pin cannot route later calls (made on other
@@ -149,7 +162,10 @@ glstate_t& glstate_t::get_instance() {
     if (context != EGL_NO_CONTEXT) {
         std::lock_guard<std::mutex> lock(instances_mutex);
         auto& slot = instances[context];
-        if (!slot) slot = std::make_unique<glstate_t>();
+        if (!slot) {
+            slot = std::make_unique<glstate_t>();
+            g_context_state_count.fetch_add(1, std::memory_order_relaxed);
+        }
         state = slot.get();
     }
     tls_snapshot_context = context;
@@ -839,6 +855,45 @@ client_array_kind_t classifyClientArrays(const vertex_pointer_array_t& raw, GLui
     return client_array_kind_t::mixed;
 }
 
+namespace {
+
+// One attribute's elements, src_stride apart, into every dst_stride-th slot
+// of an interleaved stream. A memcpy of a constant size compiles to a few
+// moves; one of a runtime size is a library call per vertex - an order of
+// magnitude slower over a whole draw. The common element sizes get the
+// former.
+template <size_t Bytes>
+void copyStridedElements(uint8_t* dst, size_t dst_stride, const uint8_t* src, size_t src_stride, GLsizei count) {
+    for (GLsizei v = 0; v < count; ++v) std::memcpy(dst + (size_t)v * dst_stride, src + (size_t)v * src_stride, Bytes);
+}
+
+void copyStridedElements(uint8_t* dst, size_t dst_stride, const uint8_t* src, size_t src_stride, GLsizei count,
+                         size_t bytes) {
+    switch (bytes) {
+    case 4:
+        return copyStridedElements<4>(dst, dst_stride, src, src_stride, count);
+    case 8:
+        return copyStridedElements<8>(dst, dst_stride, src, src_stride, count);
+    case 12:
+        return copyStridedElements<12>(dst, dst_stride, src, src_stride, count);
+    case 16:
+        return copyStridedElements<16>(dst, dst_stride, src, src_stride, count);
+    default:
+        for (GLsizei v = 0; v < count; ++v)
+            std::memcpy(dst + (size_t)v * dst_stride, src + (size_t)v * src_stride, bytes);
+    }
+}
+
+// The gathers' output buffer, grown and never shrunk: resizing it to each
+// draw's own size zero-fills whatever it grows back into, a pass over bytes
+// the gather is about to overwrite.
+uint8_t* gatherScratch(std::vector<uint8_t>& buffer, size_t size) {
+    if (buffer.size() < size) buffer.resize(size);
+    return buffer.data();
+}
+
+} // namespace
+
 // Multiple INDEPENDENT client-memory arrays (classic GL 1.1: separate
 // glVertexPointer/glColorPointer allocations) cannot be expressed by
 // normalize()'s single interleave stride. Gather them into one interleaved
@@ -896,7 +951,8 @@ bool gather_client_arrays(const vertex_pointer_array_t& raw, GLint first, GLsize
     static thread_local std::vector<uint8_t> gathered;
     const size_t total_size = (size_t)count * total_stride;
     if (total_size > (size_t)std::numeric_limits<GLsizei>::max()) return false;
-    gathered.resize(total_size);
+    uint8_t* const stream = gatherScratch(gathered, total_size);
+    SFPEW_PERF_TIMED(copy_client_gather, total_size);
 
     *out = raw;
     size_t attribute_offset = 0;
@@ -906,17 +962,23 @@ bool gather_client_arrays(const vertex_pointer_array_t& raw, GLint first, GLsize
         const size_t src_stride =
             attr.stride != 0 ? (size_t)attr.stride : element_bytes[i];
         const auto* src = static_cast<const uint8_t*>(attr.pointer) + (size_t)first * src_stride;
-        uint8_t* dst = gathered.data() + attribute_offset;
-        for (GLsizei v = 0; v < count; ++v)
-            std::memcpy(dst + (size_t)v * total_stride, src + (size_t)v * src_stride,
-                        element_bytes[i]);
+        copyStridedElements(stream + attribute_offset, total_stride, src, src_stride, count, element_bytes[i]);
         out->attributes[i].pointer = (const void*)attribute_offset;
         out->attributes[i].stride = (GLsizei)total_stride;
         attribute_offset += element_bytes[i];
     }
-    out->starting_pointer = gathered.data();
+    out->starting_pointer = stream;
     out->stride = (GLsizei)total_stride;
     return true;
+}
+
+// Test-only view of what the fixed-function path compiled: the fragment
+// source of the program the last fixed-function draw used, or nullptr before
+// one. What a generated shader costs the GPU - its precision, whether it
+// carries a discard - is invisible in the pixels it draws.
+SFPEW_APIENTRY const char* sfpewLastFixedFunctionFragmentSourceForTest() {
+    const auto& state = g_glstate;
+    return state.last_program != nullptr ? state.last_program->fs.c_str() : nullptr;
 }
 
 // Test-only view of the gather's input validation. The gl*Pointer entry
@@ -993,7 +1055,8 @@ bool gather_mixed_client_arrays(const vertex_pointer_array_t& raw, GLint first, 
 
     static thread_local std::vector<uint8_t> gathered;
     static thread_local std::vector<uint8_t> attribute_scratch;
-    gathered.resize(total_size);
+    uint8_t* const stream = gatherScratch(gathered, total_size);
+    SFPEW_PERF_TIMED(copy_client_gather, total_size);
 
     *out = raw;
     size_t attribute_offset = 0;
@@ -1004,7 +1067,7 @@ bool gather_mixed_client_arrays(const vertex_pointer_array_t& raw, GLint first, 
                                    attribute_scratch)) {
             return false;
         }
-        uint8_t* dst = gathered.data() + attribute_offset;
+        uint8_t* dst = stream + attribute_offset;
         if (attr.type == GL_DOUBLE) {
             for (GLsizei v = 0; v < count; ++v) {
                 for (GLint c = 0; c < attr.size; ++c) {
@@ -1019,17 +1082,14 @@ bool gather_mixed_client_arrays(const vertex_pointer_array_t& raw, GLint first, 
             }
             out->attributes[i].type = GL_FLOAT;
         } else {
-            for (GLsizei v = 0; v < count; ++v) {
-                std::memcpy(dst + (size_t)v * total_stride,
-                            attribute_scratch.data() + (size_t)v * element_bytes[i],
-                            element_bytes[i]);
-            }
+            copyStridedElements(dst, total_stride, attribute_scratch.data(), element_bytes[i], count,
+                                element_bytes[i]);
         }
         out->attributes[i].pointer = (const void*)attribute_offset;
         out->attributes[i].stride = (GLsizei)total_stride;
         attribute_offset += element_bytes[i];
     }
-    out->starting_pointer = gathered.data();
+    out->starting_pointer = stream;
     out->stride = (GLsizei)total_stride;
     return true;
 }
@@ -1084,6 +1144,8 @@ int commit_fpe_state_on_draw(GLenum* mode, GLint* first, GLsizei* count, GLint p
     const bool layout_reused =
         !raw_vpa.dirty && g_glstate_c.fpe_normalized_valid &&
         std::memcmp(&g_glstate_c.fpe_normalized_sizes, &live_sizes, sizeof(live_sizes)) == 0;
+    SFPEW_PERF_COUNT(draw_arrays);
+    if (layout_reused) SFPEW_PERF_COUNT(draw_arrays_layout_reuse);
     if (!layout_reused) {
         if (gather_client_arrays(raw_vpa, *first, *count, &vpa)) {
             *first = 0; // the gather already applied the base offset
@@ -1225,7 +1287,12 @@ int commit_fpe_state_on_draw(GLenum* mode, GLint* first, GLsizei* count, GLint p
             }
             const auto* draw_start = static_cast<const uint8_t*>(vpa.starting_pointer) + skip;
             auto& st = g_glstate_c.fpe_state;
-            g_glFuncs.glBindBuffer(GL_ARRAY_BUFFER, st.fpe_immediate_vbo);
+            // The arm says when the ring is bound already: a run of
+            // client-array draws (the GUI, entities, particles) binds it once.
+            if (gsc.immediate_live_buffer != st.fpe_immediate_vbo) {
+                g_glFuncs.glBindBuffer(GL_ARRAY_BUFFER, st.fpe_immediate_vbo);
+                gsc.immediate_live_buffer = st.fpe_immediate_vbo;
+            }
             const GLintptr ring_offset =
                 sfpewUploadImmediateVertexData(draw_start, (size_t)upload_size);
             // Fresh read: the upload can replace the ring buffer object.

@@ -8,6 +8,7 @@
 
 #include "fpe_shadergen.h"
 #include "../log.h"
+#include "../perf_counters.h"
 #include "types.h"
 #include <cstdio>
 #include <format>
@@ -1112,35 +1113,50 @@ const char* glEnumToString(GLenum e) {
 // first, then sampler2DShadow the same way when GL_ARB_shadow added it)
 // tolerate the omission anyway; GLES spec-conformant ones correctly refuse
 // to compile with "No precision specified in this scope for type `...'".
+//
+// The precision statements are unconditional: the source is always ESSL, so
+// GL_ES is always defined on a real driver, and a backend that rewrites the
+// #version to desktop GLSL (MobileGL does) no longer defines it - a guarded
+// statement would vanish there and every float would compile as fp32.
 constexpr std::string_view mg_shader_header = "#version 300 es\n"
                                                "// MobileGlues FPE Shader\n"
-                                               "#ifdef GL_ES\n"
                                                "precision highp float;\n"
                                                "precision highp int;\n"
                                                "precision highp sampler3D;\n"
-                                               "precision highp sampler2DShadow;\n"
-                                               "#endif\n";
+                                               "precision highp sampler2DShadow;\n";
 constexpr std::string_view mg_vs_header = "// ** Vertex Shader **\n";
-constexpr std::string_view mg_fs_header = "// ** Fragment Shader **\n";
-constexpr std::string_view mg_fog_linear_func = "float fog_linear(float distance, float start, float end) {\n"
+// Fragment math defaults to mediump, the precision GLES fixed-function
+// emulation has always used (gl4es does the same): on Mali and other tilers
+// fp16 runs at twice the rate of fp32 and fills half the registers, and the
+// color, texenv and fog arithmetic here is 8-bit-per-channel work. What feeds
+// a texture coordinate or a distance stays highp, declared so explicitly:
+// texcoords sampled from a 1024-texel atlas need more than fp16's 11-bit
+// mantissa, or texel edges land on the neighbor. The 2D and cube samplers are
+// declared mediump too: ESSL already defaults them to lowp, but a backend
+// compiling the source as desktop GLSL would default them to highp.
+constexpr std::string_view mg_fs_header = "// ** Fragment Shader **\n"
+                                          "precision mediump float;\n"
+                                          "precision mediump sampler2D;\n"
+                                          "precision mediump samplerCube;\n";
+constexpr std::string_view mg_fog_linear_func = "float fog_linear(highp float distance, highp float start, highp float end) {\n"
                                                 "    return clamp((end - distance) / max(end - start, 1e-6), 0., 1.);\n"
                                                 "}\n";
-constexpr std::string_view mg_fog_exp_func = "float fog_exp(float distance, float density) {\n"
+constexpr std::string_view mg_fog_exp_func = "float fog_exp(highp float distance, highp float density) {\n"
                                              "    return clamp(exp(-density * distance), 0., 1.);\n"
                                              "}\n";
-constexpr std::string_view mg_fog_exp2_func = "float fog_exp2(float distance, float density) {\n"
-                                              "    float scaled = density * distance;\n"
+constexpr std::string_view mg_fog_exp2_func = "float fog_exp2(highp float distance, highp float density) {\n"
+                                              "    highp float scaled = density * distance;\n"
                                               "    return clamp(exp(-scaled * scaled), 0., 1.);\n"
                                               "}\n";
 constexpr std::string_view mg_fog_apply_fog_func = "vec3 apply_fog(vec3 objColor, vec3 fogColor, float fogFactor) {\n"
                                                    "    return mix(fogColor, objColor, fogFactor);\n"
                                                    "}\n";
 constexpr std::string_view mg_fog_uniforms = "uniform vec4 FogColor;\n"
-                                             "uniform float FogDensity;\n"
-                                             "uniform float FogStart;\n"
-                                             "uniform float FogEnd;\n";
+                                             "uniform highp float FogDensity;\n"
+                                             "uniform highp float FogStart;\n"
+                                             "uniform highp float FogEnd;\n";
 
-constexpr std::string_view mg_alpharef_uniform = "uniform float alpharef;\n"
+constexpr std::string_view mg_alpharef_uniform = "uniform highp float alpharef;\n"
                                                  "uniform int alphafunc;\n";
 
 std::string vp2in_name(GLenum vp, int index) {
@@ -1336,6 +1352,34 @@ bool unit_has_point_sprite_replace(const fixed_function_state_t& state, int unit
            !state.fpe_bools.texture_shadow_sample[unit];
 }
 
+// Texcoord components the fragment stage samples for a unit: s,t for a 2D
+// texture, s,t,r for 3D, cube and shadow-compare units, none while the unit
+// has no texture enabled. The varying carries exactly those - on a tiler
+// every varying component is written out per vertex and interpolated per
+// fragment, and a vertex-dense terrain draw paid for components nothing read.
+int texcoord_components(const fixed_function_state_t& state, int unit) {
+    switch (active_texture_target(state, unit)) {
+    case texture_target_kind_t::none:
+        return 0;
+    case texture_target_kind_t::tex2d:
+        return state.fpe_bools.texture_shadow_sample[unit] ? 3 : 2;
+    default:
+        return 3;
+    }
+}
+
+const char* texcoord_swizzle(int components) { return components == 2 ? "xy" : "xyz"; }
+
+// GL_EYE_RADIAL_NV needs the eye position per fragment: length() of an
+// interpolated position is not the interpolated length. Every other
+// fragment-depth fog distance is affine in eye space, so the eye z alone
+// interpolates to exactly the per-fragment value. It stays signed: an abs()
+// taken per vertex would bend the interpolation across a triangle clipped
+// at the eye plane, where visible fragments are all in front.
+bool fog_needs_radial_position(const fixed_function_state_t& state) {
+    return fog_needs_view_position(state) && state.fog_distance_mode == GL_EYE_RADIAL_NV;
+}
+
 void add_vs_inout(const fixed_function_state_t& state, scratch_t& scratch, std::string& vs) {
     auto& vpa = state.normalized_vpa;
     // LOG_D("[shadergen] enabled_ptr: 0x%x", vpa.enabled_pointers)
@@ -1379,8 +1423,30 @@ void add_vs_inout(const fixed_function_state_t& state, scratch_t& scratch, std::
             }
 
             std::string out_name = vp2out_name(usage, i);
+            if (texid >= 0) {
+                // Texture coordinates first pass through the matrix belonging
+                // to their server texture unit.
+                scratch.has_texcoord[texid] = true;
+                const int components = texcoord_components(state, texid);
+                if (components > 0) {
+                    vs += std::format("out highp vec{} {};\n", components, out_name);
+                    scratch.last_stage_linkage += std::format("in highp vec{} {};\n", components, out_name);
+                    scratch.vs_body += std::format("    {} = (TexMat{} * {}).{};\n", out_name, texid, in_name,
+                                                   texcoord_swizzle(components));
+                }
+                continue;
+            }
+            if (usage == GL_NORMAL_ARRAY) {
+                // Lighting and texgen read the normal in this stage; nothing
+                // downstream does, so it is not forwarded.
+                scratch.has_normal_input = true;
+                continue;
+            }
             std::string linkage;
 
+            // The fog coordinate is a distance: it stays highp under the
+            // fragment stage's mediump default (mg_fs_header).
+            if (usage == GL_FOG_COORD_ARRAY) linkage += "highp ";
             linkage += type;
             linkage += ' ';
             linkage += out_name;
@@ -1394,13 +1460,7 @@ void add_vs_inout(const fixed_function_state_t& state, scratch_t& scratch, std::
             if (color_varying) scratch.last_stage_linkage += "flat ";
             scratch.last_stage_linkage += "in " + linkage;
 
-            // TODO: Fog / vertex lighting. Texture coordinates first pass
-            // through the matrix belonging to their server texture unit.
-            if (texid >= 0) {
-                scratch.vs_body += std::format("    {} = TexMat{} * {};\n", out_name, texid, in_name);
-                // LOG_D("has_texcoord[%d] = true", texid)
-                scratch.has_texcoord[texid] = true;
-            } else if (vpa.attributes[i].bgra && !sfpewBackendTakesBgra()) {
+            if (vpa.attributes[i].bgra && !sfpewBackendTakesBgra()) {
                 // The array was declared GL_BGRA and the backend has no such
                 // format, so it was uploaded as four plain components in the
                 // application's order. Undo that order here - the one place
@@ -1415,7 +1475,6 @@ void add_vs_inout(const fixed_function_state_t& state, scratch_t& scratch, std::
                 scratch.has_color_input = true;
                 scratch.has_vertex_color = true;
             }
-            if (usage == GL_NORMAL_ARRAY) scratch.has_normal_input = true;
             if (usage == GL_FOG_COORD_ARRAY) scratch.has_fog_coord_input = true;
             if (usage == GL_SECONDARY_COLOR_ARRAY) scratch.has_secondary_color_input = true;
         }
@@ -1447,19 +1506,24 @@ void add_vs_inout(const fixed_function_state_t& state, scratch_t& scratch, std::
     // Units fed purely by texgen still need their varying.
     for (int i = 0; i < MAX_TEX; ++i) {
         if (!unit_uses_texgen(state, i) || scratch.has_texcoord[i]) continue;
-        vs += std::format("out vec4 texCoord{};\n", i);
-        scratch.last_stage_linkage += std::format("in vec4 texCoord{};\n", i);
+        const int components = texcoord_components(state, i);
+        if (components > 0) {
+            vs += std::format("out highp vec{} texCoord{};\n", components, i);
+            scratch.last_stage_linkage += std::format("in highp vec{} texCoord{};\n", components, i);
+        }
         scratch.has_texcoord[i] = true;
         scratch.texgen_no_input[i] = true; // the texgen body block writes it
     }
 
-    if (fog_needs_view_position(state)) {
-        vs += "out vec3 vViewPosition;\n";
+    if (fog_needs_radial_position(state)) {
+        vs += "out highp vec3 vViewPosition;\n";
+    } else if (fog_needs_view_position(state)) {
+        vs += "out highp float vEyeZ;\n";
     }
     for (int i = 0; i < 6; ++i) {
         if (!state.fpe_bools.clip_plane_enable[i]) continue;
         vs += std::format("out float vClipDistance{};\n", i);
-        scratch.last_stage_linkage += std::format("in float vClipDistance{};\n", i);
+        scratch.last_stage_linkage += std::format("in highp float vClipDistance{};\n", i);
     }
     // defects-plan-2.md 2.3: GL_POINT_FADE_THRESHOLD_SIZE only has a
     // rendering effect alongside distance attenuation (spec 3.3 - the fade
@@ -1645,8 +1709,10 @@ void add_vs_body(const fixed_function_state_t& state, scratch_t& scratch, std::s
         if (state.fpe_bools.clip_plane_enable[i])
             vs += std::format("    vClipDistance{0} = dot(ClipPlane{0}, eyePosition);\n", i);
     }
-    if (fog_needs_view_position(state)) {
+    if (fog_needs_radial_position(state)) {
         vs += "    vViewPosition = eyePosition.xyz;\n";
+    } else if (fog_needs_view_position(state)) {
+        vs += "    vEyeZ = eyePosition.z;\n";
     }
     vs += scratch.vs_body;
 
@@ -1704,7 +1770,9 @@ void add_vs_body(const fixed_function_state_t& state, scratch_t& scratch, std::s
                 }
                 vs += std::format("    tgsrc{}.{} = {};\n", i, comp[c], value);
             }
-            vs += std::format("    texCoord{0} = TexMat{0} * tgsrc{0};\n", i);
+            const int components = texcoord_components(state, i);
+            if (components > 0)
+                vs += std::format("    texCoord{0} = (TexMat{0} * tgsrc{0}).{1};\n", i, texcoord_swizzle(components));
         }
     }
 
@@ -1751,7 +1819,7 @@ void add_fs_uniforms(const fixed_function_state_t& state, [[maybe_unused]] scrat
                                    : state.fpe_bools.texture_shadow_sample[i] ? "sampler2DShadow"
                                                                               : "sampler2D";
         fs += std::format("uniform {} Sampler{};\n", sampler_type, i);
-        fs += std::format("uniform float LodBias{};\n", i);
+        if (state.fpe_bools.texture_lod_biased[i]) fs += std::format("uniform highp float LodBias{};\n", i);
         if (state.texture_env_mode[i] == GL_BLEND || state.texture_env_mode[i] == GL_COMBINE) {
             fs += std::format("uniform vec4 TexEnvColor{};\n", i);
         }
@@ -1761,11 +1829,10 @@ void add_fs_uniforms(const fixed_function_state_t& state, [[maybe_unused]] scrat
         fs += mg_fog_uniforms;
     }
 
-    // Alpha test is uniform-driven (0 = off/GL_ALWAYS): declared in every
-    // program so GL_ALPHA_TEST toggles and glAlphaFunc changes never mint a
-    // new program. The branch below is uniform-coherent, which drivers
-    // specialize.
-    fs += mg_alpharef_uniform;
+    // Only a program drawn with GL_ALPHA_TEST enabled carries the test (and
+    // its discard, see glstate_t::program_hash); the comparison itself is
+    // uniform-driven, so glAlphaFunc changes never mint a program.
+    if (state.fpe_bools.alpha_test_enable) fs += mg_alpharef_uniform;
 }
 
 void add_fs_inout(const fixed_function_state_t& state, scratch_t& scratch, std::string& fs) {
@@ -1773,7 +1840,7 @@ void add_fs_inout(const fixed_function_state_t& state, scratch_t& scratch, std::
     fs += scratch.last_stage_linkage;
     fs += "\n";
     if (fog_needs_view_position(state)) {
-        fs += "in vec3 vViewPosition;\n";
+        fs += fog_needs_radial_position(state) ? "in highp vec3 vViewPosition;\n" : "in highp float vEyeZ;\n";
     }
     fs += "out vec4 FragColor;\n";
 }
@@ -1924,6 +1991,9 @@ void add_fs_body(const fixed_function_state_t& state, scratch_t& scratch, std::s
                 "1.0 - gl_PointCoord.y : gl_PointCoord.y) : {})",
                 coord);
         }
+        // Only a biased unit passes the bias (fixed_function_bool_t::texture_lod_biased).
+        const std::string bias =
+            state.fpe_bools.texture_lod_biased[i] ? std::format(", LodBias{}", i) : std::string();
         if (state.fpe_bools.texture_shadow_sample[i]) {
             // GL 1.4/ARB_shadow: the R texcoord is the reference depth. A
             // sampler2DShadow overload of texture() returns a plain float
@@ -1937,13 +2007,13 @@ void add_fs_body(const fixed_function_state_t& state, scratch_t& scratch, std::s
                                                             : std::string("0.0");
             fs += std::format("\n"
                               "    // Texturing #{0} (GL_ARB_shadow depth compare)\n"
-                              "    vec4 texcolor{0} = vec4(texture(Sampler{0}, vec3({1}, {2}), LodBias{0}));\n",
-                              i, coord, ref);
+                              "    vec4 texcolor{0} = vec4(texture(Sampler{0}, vec3({1}, {2}){3}));\n",
+                              i, coord, ref, bias);
         } else {
             fs += std::format("\n"
                               "    // Texturing #{0}\n"
-                              "    vec4 texcolor{0} = texture(Sampler{0}, {1}, LodBias{0});\n",
-                              i, coord);
+                              "    vec4 texcolor{0} = texture(Sampler{0}, {1}{2});\n",
+                              i, coord, bias);
         }
     }
 
@@ -2033,34 +2103,41 @@ void add_fs_body(const fixed_function_state_t& state, scratch_t& scratch, std::s
     }
 
     // Alpha test: uniform-selected comparison, GL_NEVER..GL_GEQUAL encoded
-    // as 1..7 (send_uniforms), 0 covers both disabled and GL_ALWAYS.
-    fs += "    // Alpha Test (uniform-driven)\n"
-          "    if (alphafunc != 0) {\n"
-          "        bool alphapass;\n"
-          "        if      (alphafunc == 1) alphapass = false;\n"
-          "        else if (alphafunc == 2) alphapass = color.a < alpharef;\n"
-          "        else if (alphafunc == 3) alphapass = abs(color.a - alpharef) <= 0.00001;\n"
-          "        else if (alphafunc == 4) alphapass = color.a <= alpharef;\n"
-          "        else if (alphafunc == 5) alphapass = color.a > alpharef;\n"
-          "        else if (alphafunc == 6) alphapass = abs(color.a - alpharef) > 0.00001;\n"
-          "        else                     alphapass = color.a >= alpharef;\n"
-          "        if (!alphapass) discard;\n"
-          "    }\n";
+    // as 1..7 (send_uniforms), 0 for GL_ALWAYS.
+    if (state.fpe_bools.alpha_test_enable) {
+        fs += "    // Alpha Test (uniform-driven)\n"
+              "    if (alphafunc != 0) {\n"
+              "        bool alphapass;\n"
+              "        if      (alphafunc == 1) alphapass = false;\n"
+              "        else if (alphafunc == 2) alphapass = color.a < alpharef;\n"
+              "        else if (alphafunc == 3) alphapass = abs(color.a - alpharef) <= 0.00001;\n"
+              "        else if (alphafunc == 4) alphapass = color.a <= alpharef;\n"
+              "        else if (alphafunc == 5) alphapass = color.a > alpharef;\n"
+              "        else if (alphafunc == 6) alphapass = abs(color.a - alpharef) > 0.00001;\n"
+              "        else                     alphapass = color.a >= alpharef;\n"
+              "        if (!alphapass) discard;\n"
+              "    }\n";
+    }
 
     // Fog calculation
     if (state.fpe_bools.fog_enable) {
         // GL_FOG_COORD_SRC (GL 1.4 core) picks between the interpolated
-        // eye-space depth and the per-vertex fog coordinate. Radial distance
-        // is a separate, optional NV extension and stays unimplemented.
-        // Per spec the fog coordinate is used unsigned.
+        // eye-space depth and the per-vertex fog coordinate; for the depth,
+        // GL_NV_fog_distance picks the measure - the distance to the eye
+        // (radial), the signed or the absolute distance to the eye plane
+        // (the default). Per spec the fog coordinate is used unsigned.
         if (state.fog_coord_src == GL_FOG_COORD && scratch.has_fog_coord_input) {
-            fs += "    float distance = abs(vertexFogCoord);\n";
+            fs += "    highp float distance = abs(vertexFogCoord);\n";
         } else if (state.fog_coord_src == GL_FOG_COORD) {
             // Source selected but nothing feeds the coordinate: GL then uses
             // the current value, which without any glFogCoord* call is 0.
-            fs += "    float distance = 0.0;\n";
+            fs += "    highp float distance = 0.0;\n";
+        } else if (state.fog_distance_mode == GL_EYE_RADIAL_NV) {
+            fs += "    highp float distance = length(vViewPosition.xyz);\n";
+        } else if (state.fog_distance_mode == GL_EYE_PLANE) {
+            fs += "    highp float distance = -vEyeZ;\n";
         } else {
-            fs += "    float distance = abs(vViewPosition.z);\n";
+            fs += "    highp float distance = abs(vEyeZ);\n";
         }
         switch (state.fog_mode) {
         case GL_LINEAR:
@@ -2125,6 +2202,7 @@ std::string fpe_shader_generator::fragment_shader(const fixed_function_state_t& 
 int program_t::get_program() {
     if (compile_attempted) return program;
     compile_attempted = true;
+    SFPEW_PERF_TIME(program_compile);
 
     int vss = compile_shader(GL_VERTEX_SHADER, vs.c_str());
     if (vss < 0) return 0;

@@ -89,6 +89,7 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         SimpleFPEWrapper/texture_image.cpp
         SimpleFPEWrapper/egl_dispatch.cpp
         SimpleFPEWrapper/lookup.cpp
+        SimpleFPEWrapper/egl_exports.cpp
         SimpleFPEWrapper/ordered_passthrough.cpp
 
         SimpleFPEWrapper/backend/loader.cpp
@@ -102,6 +103,8 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         SimpleFPEWrapper/fpe/vertexpointer.cpp
         SimpleFPEWrapper/fpe/list.cpp
         SimpleFPEWrapper/fpe/list_diagnostics.cpp
+        SimpleFPEWrapper/perf_counters.cpp
+        SimpleFPEWrapper/perf_backend.cpp
         SimpleFPEWrapper/fpe/list_capture.cpp
         SimpleFPEWrapper/fpe/draw_now.cpp
         SimpleFPEWrapper/fpe/attribstack.cpp
@@ -131,6 +134,15 @@ target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE -Wall -Wextra)
 option(SFPEW_LIST_DEBUG "Compile the display-list accounting and its bisection switches" OFF)
 if(SFPEW_LIST_DEBUG)
         target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE SFPEW_LIST_DEBUG=1)
+endif()
+
+# Performance counters for debugging (SimpleFPEWrapper/perf_counters.h): how
+# often each hot-path event happens and what the coarse ones cost. Out of a
+# normal build entirely; compiled in, they count always and report once
+# SFPEW_PERF is set at runtime.
+option(SFPEW_PERF_COUNTERS "Compile the debug performance counters" OFF)
+if(SFPEW_PERF_COUNTERS)
+        target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE SFPEW_PERF_COUNTERS=1)
 endif()
 
 # The git commit this build came from, reported alongside the version in
@@ -329,7 +341,7 @@ if(NOT ANDROID)
                                        color_sum logicop line_stipple texture_3d_cube
                                        read_buffer point_sprite texgen_cube
                                        drawpixels_stencil pixel_transfer_readback lod_bias
-                                       depth_texture_mode texture_shadow
+                                       depth_texture_mode texture_shadow texture_parameter_cache proxy_texture current_attrib_cache egl_exports fpe_shader_cost
                                        texture_anisotropic texture_compressed_2d
                                        texture_border_clamp occlusion_query
                                        texture_env_crossbar multitexture_unit_validation
@@ -349,7 +361,8 @@ if(NOT ANDROID)
                                        user_program_generic_arrays
                                        texture_legacy_swizzle compressed_dlist_pbo
                                        texture_scratch_context egl_direct_dispatch
-                                       pixel_dlist_record bitmap_dlist_advance)
+                                       pixel_dlist_record bitmap_dlist_advance
+                                       perf_counters)
                                 sfpew_add_gtest(sfpew_${suite}_test SOURCES tests/gtest_${suite}.cc
                                                 LIBRARIES ${SFPEW_TEST_EGL})
                         endforeach()
@@ -366,6 +379,19 @@ if(NOT ANDROID)
                         # glCompileShader, so it links the system GLES too.
                         sfpew_add_gtest(sfpew_translator_test SOURCES tests/gtest_translator.cc
                                         LIBRARIES ${SFPEW_TEST_EGL} ${SFPEW_TEST_GLES})
+
+                        # A backend resolving GL names through the global
+                        # scope, for the egl_exports case that loads the
+                        # wrapper globally the way a launcher does.
+                        add_library(sfpew_global_resolver_backend SHARED tests/global_resolver_backend.c)
+                        target_include_directories(sfpew_global_resolver_backend PRIVATE ${CMAKE_SOURCE_DIR}/include)
+                        # Nothing here calls GL; the dependency is what holds
+                        # the definitions this backend should hand out.
+                        target_link_options(sfpew_global_resolver_backend PRIVATE "LINKER:--no-as-needed")
+                        target_link_libraries(sfpew_global_resolver_backend PRIVATE dl ${SFPEW_TEST_EGL} ${SFPEW_TEST_GLES})
+                        target_compile_definitions(sfpew_egl_exports_test PRIVATE
+                                SFPEW_GLOBAL_RESOLVER_BACKEND="$<TARGET_FILE:sfpew_global_resolver_backend>")
+                        add_dependencies(sfpew_egl_exports_test sfpew_global_resolver_backend)
 
 
 

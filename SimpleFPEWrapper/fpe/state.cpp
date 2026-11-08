@@ -13,6 +13,7 @@
 #include "list.h"
 #include "pointer_utils.h"
 #include "../init.h"
+#include "../perf_counters.h"
 
 #include <algorithm>
 #include <cstring>
@@ -363,8 +364,12 @@ static int backendEnableSlot(GLenum cap) {
 static bool backendEnableRedundant(glstate_t& gs, GLenum cap, bool enable) {
     const int slot = backendEnableSlot(cap);
     if (slot < 0) return false;
+    SFPEW_PERF_COUNT(app_state);
     auto& shadow = gs.fpe_state.backend_state;
-    if (shadow.enable_known[slot] && shadow.enable_value[slot] == enable) return true;
+    if (shadow.enable_known[slot] && shadow.enable_value[slot] == enable) {
+        SFPEW_PERF_COUNT(redundant_state);
+        return true;
+    }
     shadow.enable_known[slot] = true;
     shadow.enable_value[slot] = enable;
     return false;
@@ -584,6 +589,7 @@ void glFogf(GLenum pname, GLfloat param) {
     case GL_FOG_MODE:
     case GL_FOG_INDEX:
     case GL_FOG_COORD_SRC:
+    case GL_FOG_DISTANCE_MODE_NV:
         SELF_CALL(glFogi, pname, (GLint)param)
         return;
 
@@ -621,6 +627,17 @@ void glFogi(GLenum pname, GLint param) {
         }
         gs.fpe_state.fog_coord_src = param;
         break;
+    case GL_FOG_DISTANCE_MODE_NV:
+        // GL_NV_fog_distance: what "distance" the fragment-depth fog source
+        // measures. Minecraft asks for the radial one whenever the extension
+        // is offered, so a cloud overhead fogs by how far away it is, not by
+        // its small depth along the view axis.
+        if (param != GL_EYE_RADIAL_NV && param != GL_EYE_PLANE && param != GL_EYE_PLANE_ABSOLUTE_NV) {
+            gs.set_error(GL_INVALID_ENUM);
+            break;
+        }
+        gs.fpe_state.fog_distance_mode = param;
+        break;
 
     // below should not be handled here
     case GL_FOG_DENSITY:
@@ -647,6 +664,7 @@ void glFogfv(GLenum pname, const GLfloat* params) {
     case GL_FOG_MODE:
     case GL_FOG_INDEX:
     case GL_FOG_COORD_SRC:
+    case GL_FOG_DISTANCE_MODE_NV:
         SELF_CALL(glFogi, pname, (GLint)params[0])
         break;
     case GL_FOG_DENSITY:
@@ -689,6 +707,7 @@ void glFogiv(GLenum pname, const GLint* params) {
     case GL_FOG_MODE:
     case GL_FOG_INDEX:
     case GL_FOG_COORD_SRC:
+    case GL_FOG_DISTANCE_MODE_NV:
         SELF_CALL(glFogi, pname, params[0])
         break;
     case GL_FOG_DENSITY:

@@ -9,6 +9,7 @@
 #include <glm/gtc/type_ptr.hpp>
 #include "drawing1x.h"
 #include "list.h"
+#include "../perf_counters.h"
 #include <algorithm>
 #include <bit>
 #include <cstdint>
@@ -30,6 +31,11 @@ constexpr size_t kRingSegments = 4u;
 // pending before some entry point flushes it.
 constexpr size_t kImmediateMergeVertexLimit = 64u;
 constexpr size_t kImmediateMergeRunLimit = 256u;
+// Runs the first batch after the GPU went idle may hold before it draws and
+// is handed over (see glstate_t::idle_kick_runs). Measured on b3_fill: one
+// flush after 16 runs recovered the whole idle gap; flushing earlier or
+// again later as the batches grew cost more in submissions than it saved.
+constexpr unsigned kIdleKickFirstRuns = 16u;
 constexpr size_t kImmediateMergeVertexBudget = 8192u;
 
 } // namespace
@@ -256,16 +262,19 @@ static GLintptr sfpewUploadToRing(const stream_ring_t& ring, const void* data, s
         for (size_t seg = 0; seg < kRingSegments; ++seg) {
             auto& fence = ring.fences[seg];
             if ((plan.wait_mask & (1u << seg)) == 0 || fence == nullptr) continue;
+            SFPEW_PERF_TIME(ring_fence_wait);
             g_glFuncs.glClientWaitSync((GLsync)fence, GL_SYNC_FLUSH_COMMANDS_BIT,
                                        1000000000ull /* 1s */);
             g_glFuncs.glDeleteSync((GLsync)fence);
             fence = nullptr;
         }
     } else if (plan.wrapped) {
+        SFPEW_PERF_COUNT(ring_wrap_finish);
         if (g_glFuncs.glFinish != nullptr) g_glFuncs.glFinish();
     }
 
     if (size > 0) {
+        SFPEW_PERF_TIMED(copy_ring_upload, size);
         std::memcpy(static_cast<uint8_t*>(ring.map) + offset, data, size);
     }
     ring.offset = offset + size;
@@ -273,22 +282,6 @@ static GLintptr sfpewUploadToRing(const stream_ring_t& ring, const void* data, s
 }
 
 namespace {
-
-struct immediate_client_state_guard_t {
-    vertex_pointer_array_t vertexPointerArray = g_glstate_c.fpe_state.vertexpointer_array;
-    vertex_pointer_array_t normalizedVertexPointerArray = g_glstate_c.fpe_state.normalized_vpa;
-
-    immediate_client_state_guard_t() = default;
-
-    ~immediate_client_state_guard_t() {
-        g_glstate_c.fpe_state.vertexpointer_array = vertexPointerArray;
-        g_glstate_c.fpe_state.normalized_vpa = normalizedVertexPointerArray;
-        g_glstate_c.fpe_normalized_valid = false;
-    }
-
-    immediate_client_state_guard_t(const immediate_client_state_guard_t&) = delete;
-    immediate_client_state_guard_t& operator=(const immediate_client_state_guard_t&) = delete;
-};
 
 struct immediate_draw_sizes_guard_t {
     fixed_function_draw_size_t sizes = g_glstate_c.fpe_state.fpe_draw.current_data.sizes;
@@ -345,7 +338,7 @@ thread_local pending_immediate_batch_t pendingGlyphBatch;
 
 } // namespace
 
-thread_local SFPEW_TLS_HOT sfpew_vertex_buffer_t* g_immediate_collect = nullptr;
+SFPEW_TLS_HOT sfpew_vertex_buffer_t* g_immediate_collect = nullptr;
 
 void sfpewStopBatchCollection(fixed_function_draw_state_t& draw) {
     auto& batch = pendingGlyphBatch;
@@ -426,13 +419,14 @@ void drawImmediateVertices(GLenum primitive, const GLfloat* vertices, size_t flo
     // immediate path): a fresh context calling glCallList first would
     // otherwise draw with fpe_vao == 0 and no ring buffer.
     if (!gs.fpe_ready && init_fpe() != 0) return;
+    SFPEW_PERF_COUNT(draw_immediate);
 
     fpe_backend_draw_state_guard_t backendState(
         sfpewLogicalProgram(), static_cast<GLint>(sfpewLogicalArrayBufferBinding()));
-    // glBegin/glEnd uses temporary interleaved data. Preserve the caller's
-    // client-array declarations so an immediate draw cannot invalidate the
-    // following glDrawArrays call.
-    immediate_client_state_guard_t clientState;
+    // glBegin/glEnd uses temporary interleaved data, described by a layout
+    // of its own (below) that is never installed over the caller's client
+    // arrays - so there is nothing of theirs to save and put back, and the
+    // caller's normalized layout stays reusable for its next array draw.
     immediate_draw_sizes_guard_t drawSizes;
 
     auto& state = gs.fpe_state;
@@ -451,35 +445,30 @@ void drawImmediateVertices(GLenum primitive, const GLfloat* vertices, size_t flo
     // All of it is a pure function of the two size blocks, which a draw loop
     // repeats unchanged, so it is cached and only rebuilt when they move.
     auto& layoutCache = state.immediate_layout;
-    auto& va = state.normalized_vpa;
     const bool layoutHit =
         layoutCache.valid &&
         std::memcmp(&layoutCache.sizes, &sizes, sizeof(sizes)) == 0 &&
         std::memcmp(&layoutCache.shader_sizes, &shader_sizes, sizeof(shader_sizes)) == 0;
-    if (layoutHit) {
-        state.vertexpointer_array = layoutCache.compiled;
-        va = layoutCache.normalized;
-    } else {
+    if (!layoutHit) {
+        SFPEW_PERF_COUNT(draw_immediate_layout_miss);
         // A scratch holder for compile_vertexattrib, which reads the sizes
         // and nothing else - no stamp needed, nothing packs through it.
         fixed_function_draw_state_t layoutState;
         layoutState.current_data.sizes = sizes;
-        layoutState.compile_vertexattrib(state.vertexpointer_array);
+        layoutState.compile_vertexattrib(layoutCache.compiled);
 
-        va = state.vertexpointer_array.normalize();
+        layoutCache.normalized = layoutCache.compiled.normalize();
         // generate_compressed_index only reads the size array, but its legacy
         // declaration is not const-correct. It must see the shader's view
         // (stream + constant slots) so attribute indices line up.
         auto mutableSizes = shader_sizes;
-        va.generate_compressed_index(mutableSizes.data);
+        layoutCache.normalized.generate_compressed_index(mutableSizes.data);
 
         layoutCache.valid = true;
         layoutCache.sizes = sizes;
         layoutCache.shader_sizes = shader_sizes;
-        layoutCache.compiled = state.vertexpointer_array;
-        layoutCache.normalized = va;
     }
-    gs.fpe_normalized_valid = false; // immediate layout overwrote the cache
+    const vertex_pointer_array_t& va = layoutCache.normalized;
 
     // Mixed front/back polygon modes need object-space positions on the CPU
     // so line/point primitives can be filtered by facing before GLES sees
@@ -570,8 +559,8 @@ void drawImmediateVertices(GLenum primitive, const GLfloat* vertices, size_t flo
         }
     }
 
-    auto key = gs.program_hash();
-    auto& program = gs.get_or_generate_program(key);
+    auto key = gs.program_hash(va);
+    auto& program = gs.get_or_generate_program(key, &va);
     const int programId = program.get_program();
     if (programId <= 0) {
         gs.set_error(GL_INVALID_OPERATION);
@@ -826,6 +815,24 @@ void appendMergedRun(GLenum primitive, const GLfloat* src, size_t count, size_t 
 // Finish a run that was collected straight into the batch. Returns false when
 // it turned out not to belong there after all, in which case the caller moves
 // it back out and takes the ordinary path.
+// How many runs the pending batch may hold before it draws: the usual cap,
+// or the shorter, growing one right after the GPU went idle.
+size_t mergeRunLimit() {
+    const unsigned kick = g_glstate_c.idle_kick_runs;
+    return kick != 0 ? kick : kImmediateMergeRunLimit;
+}
+
+// After the first draw issued while the GPU is idle: hand it over now
+// rather than when the driver's command buffer fills. Once is enough - the
+// GPU then has work queued while the CPU builds the next batch.
+void kickIdleGpu() {
+    auto& kick = g_glstate_c.idle_kick_runs;
+    if (kick == 0) return;
+    SFPEW_PERF_COUNT(immediate_idle_kick);
+    if (g_glFuncs.glFlush != nullptr) g_glFuncs.glFlush();
+    kick = 0;
+}
+
 bool acceptCollectedRun(fixed_function_draw_state_t& draw) {
     auto& batch = pendingGlyphBatch;
     // The batch must still be the one glBegin looked at: an entry point in
@@ -857,8 +864,7 @@ bool acceptCollectedRun(fixed_function_draw_state_t& draw) {
     batch.vertexCount += draw.vertex_count;
     ++batch.runCount;
     g_immediate_collect = nullptr;
-    if (batch.runCount >= kImmediateMergeRunLimit ||
-        batch.vertexCount >= kImmediateMergeVertexBudget) {
+    if (batch.runCount >= mergeRunLimit() || batch.vertexCount >= kImmediateMergeVertexBudget) {
         flushPendingImmediateDraws();
     }
     return true;
@@ -944,8 +950,7 @@ bool queueImmediateRun(const fixed_function_draw_state_t& draw) {
     batch.vertexCount += appended;
     ++batch.runCount;
 
-    if (batch.runCount >= kImmediateMergeRunLimit ||
-        batch.vertexCount >= kImmediateMergeVertexBudget) {
+    if (batch.runCount >= mergeRunLimit() || batch.vertexCount >= kImmediateMergeVertexBudget) {
         flushPendingImmediateDraws();
     }
     return true;
@@ -959,6 +964,7 @@ void sfpewFlushDeferredDrawState() {
     auto& held = g_glstate_c.deferred_draw;
     if (!held.held) return;
     held.held = false;
+    SFPEW_PERF_COUNT(barrier_restore);
 
     if (g_glFuncs.glUseProgram == nullptr || g_glFuncs.glBindVertexArray == nullptr ||
         g_glFuncs.glBindBuffer == nullptr) {
@@ -991,6 +997,13 @@ void sfpewFlushDeferredDrawState() {
 // cannot show the frame-ordering bug in pixels (there is no real swap), so the
 // regression test asserts on this instead.
 SFPEW_APIENTRY bool sfpewImmediateBatchPendingForTest() { return pendingGlyphBatch.active; }
+
+void sfpewNoteGpuIdle() {
+    if (!sfpewBackendIsImmediateModeRenderer()) return;
+    // Strict: reached from glFinish, a swap and glReadPixels after their own
+    // backend call, none of which resolved the context first.
+    g_glstate.idle_kick_runs = kIdleKickFirstRuns;
+}
 
 void flushPendingImmediateDraws() {
     // A run being built straight into the batch is not part of it yet.
@@ -1031,11 +1044,13 @@ void flushPendingImmediateDraws() {
     // drawn twice.
     const GLenum primitive = batch.unexpanded ? batch.unexpandedPrimitive : batch.primitive;
     const size_t vertexCount = batch.vertexCount;
+    SFPEW_PERF_ADD(immediate_batch_draw, batch.runCount);
     batch.active = false;
     batch.vertexCount = 0;
     batch.runCount = 0;
     drawImmediateVertices(primitive, batch.vertices.data(), batch.vertices.size(), vertexCount,
                           batch.sizes);
+    kickIdleGpu();
 
     if (callerTexture2D != batch.texture2D)
         g_glFuncs.glBindTexture(GL_TEXTURE_2D, callerTexture2D);
@@ -1503,11 +1518,14 @@ void glEnd() {
         return;
     }
 
+    SFPEW_PERF_ADD(app_draw_immediate, s.vertex_count);
+
     // A run built straight into the pending batch: everything the merge
     // decision could not know at glBegin is checked here, and the run is
     // moved back out if any of it fails.
     if (g_immediate_collect != nullptr) {
         if (acceptCollectedRun(s)) {
+            SFPEW_PERF_COUNT(immediate_merged_run);
             s.reset();
             return;
         }
@@ -1515,6 +1533,7 @@ void glEnd() {
     }
 
     if (queueImmediateRun(s)) {
+        SFPEW_PERF_COUNT(immediate_merged_run);
         s.reset();
         return;
     }
@@ -1531,8 +1550,10 @@ void glEnd() {
     }
 
     flushPendingImmediateDraws();
+    SFPEW_PERF_COUNT(immediate_direct_draw);
     drawImmediateVertices(s.primitive, s.vb.data(), s.vb.size(), s.vertex_count,
                           s.current_data.sizes, nullptr, 0, &s.edge_flags);
+    kickIdleGpu();
     s.reset();
 }
 

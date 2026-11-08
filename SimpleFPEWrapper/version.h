@@ -83,9 +83,9 @@ struct sfpew_version_t {
 
 inline constexpr const char* kSfpewProjectName = "SFPEW";
 inline constexpr const char* kSfpewProjectFullName = "Simple FPE Wrapper";
-inline constexpr sfpew_version_t kSfpewVersion = {26, 8, 0, "-dev",
+inline constexpr sfpew_version_t kSfpewVersion = {26, 11, 0, "-dev",
                                                   sfpew_version_type_t::Development};
-// "26.08-dev": both parts padded to two digits, the patch hidden while it is
+// "26.11-dev": both parts padded to two digits, the patch hidden while it is
 // 0, the suffix kept.
 inline constexpr sfpew_version_format_t kSfpewVersionFormat = {2, 2, 0, true, true};
 
@@ -98,16 +98,18 @@ inline const char* sfpewVersionTypeName(sfpew_version_type_t type) {
     return "unknown";
 }
 
-// "26.08-dev". Formatted once; the pointer stays valid for the process.
+// "26.11-dev". Formatted once; the pointer stays valid for the process.
 inline const char* sfpewVersionString() {
     static const std::string cached = kSfpewVersion.format(kSfpewVersionFormat);
     return cached.c_str();
 }
 
-// "26.08-dev, GIT@<commit>" - what goes into GL_VERSION, where a user
-// reading a crash report needs both halves.
+// "26.11-dev, GIT@<commit>" - what goes into GL_VERSION, where a user
+// reading a crash report needs both halves. The commit is abbreviated to the
+// conventional 7 characters there, a string games show and log; the
+// initialization log line keeps the full stamp.
 inline const char* sfpewVersionAndCommit() {
     static const std::string cached =
-        std::string(sfpewVersionString()) + ", GIT@" + SFPEW_GIT_COMMIT;
+        std::string(sfpewVersionString()) + ", GIT@" + std::string(SFPEW_GIT_COMMIT).substr(0, 7);
     return cached.c_str();
 }

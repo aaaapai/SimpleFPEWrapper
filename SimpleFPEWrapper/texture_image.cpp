@@ -20,6 +20,7 @@
 #include "fpe/drawing1x.h"
 #include "fpe/list.h"
 #include "fpe/imaging.h"
+#include "perf_counters.h"
 
 namespace {
 struct ProxyTexture2DLevel {
@@ -1255,28 +1256,29 @@ bool sfpewPrepareBgraUpload(GLsizei width, GLsizei height, GLenum type, const vo
         source = static_cast<const uint8_t*>(pixels);
     }
 
+    // Grown, never shrunk: resizing to each upload's own size zero-fills
+    // whatever it grows back into, a pass over bytes about to be overwritten.
     thread_local std::vector<uint8_t> scratch;
-    scratch.resize((size_t)width * (size_t)height * 4u);
+    const size_t converted_size = (size_t)width * (size_t)height * 4u;
+    if (scratch.size() < converted_size) scratch.resize(converted_size);
+    SFPEW_PERF_TIMED(copy_bgra_convert, converted_size);
     for (size_t row = 0; row < (size_t)height; ++row) {
         const uint8_t* in = source + start + row * row_px * 4u;
         uint8_t* line = scratch.data() + row * (size_t)width * 4u;
-        if (type == GL_UNSIGNED_INT_8_8_8_8) {
-            // Big-endian component packing: bytes in memory are A,R,G,B on a
-            // little-endian host.
-            for (size_t px = 0; px < (size_t)width * 4u; px += 4) {
-                line[px + 0] = in[px + 1];
-                line[px + 1] = in[px + 2];
-                line[px + 2] = in[px + 3];
-                line[px + 3] = in[px + 0];
+        // Whole pixels as little-endian words, which vectorizes; memcpy keeps
+        // the unaligned source and destination defined.
+        for (size_t px = 0; px < (size_t)width * 4u; px += 4) {
+            uint32_t v;
+            std::memcpy(&v, in + px, 4);
+            if (type == GL_UNSIGNED_INT_8_8_8_8) {
+                // Big-endian component packing: bytes in memory are A,R,G,B
+                // on a little-endian host.
+                v = (v >> 8) | (v << 24);
+            } else {
+                // GL_UNSIGNED_BYTE and _REV both lay the bytes out B,G,R,A.
+                v = (v & 0xFF00FF00u) | ((v >> 16) & 0xFFu) | ((v & 0xFFu) << 16);
             }
-        } else {
-            // GL_UNSIGNED_BYTE and _REV both lay the bytes out B,G,R,A.
-            for (size_t px = 0; px < (size_t)width * 4u; px += 4) {
-                line[px + 0] = in[px + 2];
-                line[px + 1] = in[px + 1];
-                line[px + 2] = in[px + 0];
-                line[px + 3] = in[px + 3];
-            }
+            std::memcpy(line + px, &v, 4);
         }
     }
 
@@ -1446,7 +1448,15 @@ void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei widt
             return;
         }
 
-        g_glFuncs.glTexImage2D(target, level, internalformat, width, height, border, format, type, pixels);
+        // GLES pairs the unsized GL_DEPTH_COMPONENT only with integer types;
+        // desktop GL also takes GL_FLOAT (1.16's main framebuffer depth
+        // texture), which GLES spells as the sized GL_DEPTH_COMPONENT32F.
+        // Metadata keeps the app's internalformat.
+        const GLint backend_internalformat =
+            internalformat == GL_DEPTH_COMPONENT && type == GL_FLOAT && sfpewBackendIsES()
+                ? GL_DEPTH_COMPONENT32F
+                : internalformat;
+        g_glFuncs.glTexImage2D(target, level, backend_internalformat, width, height, border, format, type, pixels);
         if (target == GL_TEXTURE_2D ||
             (target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z)) {
             const GLuint bound = sfpewLogicalTextureBinding(textureMetadataTarget(target));
@@ -1474,7 +1484,12 @@ void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei widt
 
     // Proxy textures only test whether an allocation would be accepted. Do not let a
     // backend inspect or copy the caller's pixels for a target that has no storage.
-    g_glFuncs.glTexImage2D(target, level, internalformat, width, height, border, format, type, nullptr);
+    // GLES has no proxy targets at all: forwarding one raised GL_INVALID_ENUM for
+    // what is a legal query (Minecraft probes its maximum atlas size this way), so
+    // only a desktop backend sees the call. The answer comes from the state
+    // recorded below either way.
+    if (!sfpewBackendIsES())
+        g_glFuncs.glTexImage2D(target, level, internalformat, width, height, border, format, type, nullptr);
 
     if (level < 0) return;
 
